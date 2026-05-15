@@ -90,3 +90,6 @@ typings/
 
 # Electron-Forge
 out/
+
+# Stray webpack bundle artifact at repo root
+/index.js

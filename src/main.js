@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, protocol, Notification } = require('electron');
+const { app, BrowserWindow, ipcMain, protocol, Notification, shell } = require('electron');
 const path = require('node:path');
 const url = require('url');
 const fs = require('fs');
@@ -6,13 +6,33 @@ const RecallAiSdk = require('@recallai/desktop-sdk');
 const axios = require('axios');
 const OpenAI = require('openai');
 const sdkLogger = require('./sdk-logger');
-require('dotenv').config();
+const botManager = require('./botManager');
+const coachingEngine = require('./coachingEngine');
+const summaryManager = require('./summaryManager');
+const tagManager = require('./tagManager');
+const serverApp = require('./server');
+
+// Load environment variables - check multiple locations for packaged app
+const dotenv = require('dotenv');
+const appPath = app.isPackaged
+  ? path.join(process.resourcesPath, '.env')
+  : path.join(__dirname, '..', '.env');
+
+// Try to load from app resources first (production), then fall back to project root (development)
+const envResult = dotenv.config({ path: appPath });
+if (envResult.error && !app.isPackaged) {
+  // Fallback for development
+  dotenv.config();
+}
+
+// Token server instance (embedded for standalone app)
+let tokenServer = null;
 
 // Function to get the OpenRouter headers
 function getHeaderLines() {
   return [
     "HTTP-Referer: https://recall.ai", // Replace with your actual app's URL
-    "X-Title: Muesli AI Notetaker"
+    "X-Title: Meeting Bot"
   ];
 }
 
@@ -22,15 +42,15 @@ const openai = new OpenAI({
   apiKey: process.env.OPENROUTER_KEY,
   defaultHeaders: {
     "HTTP-Referer": "https://recall.ai",
-    "X-Title": "Muesli AI Notetaker"
+    "X-Title": "Meeting Bot"
   }
 });
 
 // Define available models with their capabilities
 const MODELS = {
   // Primary models
-  PRIMARY: "anthropic/claude-3.7-sonnet",
-  FALLBACKS: []
+  PRIMARY: "anthropic/claude-haiku-4.5",
+  FALLBACKS: ["anthropic/claude-sonnet-4.5"]
 };
 
 // Handle creating/removing shortcuts on Windows when installing/uninstalling.
@@ -92,6 +112,11 @@ const createWindow = () => {
 // initialization and is ready to create browser windows.
 // Some APIs can only be used after this event occurs.
 app.whenReady().then(() => {
+  // Start embedded token server
+  tokenServer = serverApp.listen(13373, () => {
+    console.log('Token server started on port 13373');
+  });
+
   console.log("Registering IPC handlers...");
   // Log all registered IPC handlers
   console.log("IPC handlers:", Object.keys(ipcMain._invokeHandlers));
@@ -130,6 +155,27 @@ app.whenReady().then(() => {
     console.error("Couldn't create the meetings file:", e);
   }
 
+  // Initialize bot types file
+  try {
+    botManager.initializeBotTypesFile();
+  } catch (e) {
+    console.error("Couldn't initialize bot types file:", e);
+  }
+
+  // Initialize summary types file
+  try {
+    summaryManager.initializeSummaryTypesFile();
+  } catch (e) {
+    console.error("Couldn't initialize summary types file:", e);
+  }
+
+  // Initialize tags file
+  try {
+    tagManager.initializeTagsFile();
+  } catch (e) {
+    console.error("Couldn't initialize tags file:", e);
+  }
+
   // Initialize the Recall.ai SDK
   initSDK();
 
@@ -156,6 +202,15 @@ app.whenReady().then(() => {
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
     app.quit();
+  }
+});
+
+// Clean up token server before quitting
+app.on('before-quit', () => {
+  if (tokenServer) {
+    tokenServer.close(() => {
+      console.log('Token server closed');
+    });
   }
 });
 
@@ -497,7 +552,19 @@ function initSDK() {
 
     // Clean up the global tracking when a meeting ends
     if (evt.window && evt.window.id && global.activeMeetingIds && global.activeMeetingIds[evt.window.id]) {
-      console.log(`Cleaning up meeting tracking for: ${evt.window.id}`);
+      const noteId = global.activeMeetingIds[evt.window.id].noteId;
+      console.log(`Cleaning up meeting tracking for: ${evt.window.id}, noteId: ${noteId}`);
+
+      // Notify renderer that recording has stopped BEFORE deleting the mapping
+      // This ensures the UI updates correctly when the meeting ends
+      if (mainWindow && !mainWindow.isDestroyed() && noteId) {
+        mainWindow.webContents.send('recording-state-change', {
+          recordingId: evt.window.id,
+          state: 'idle',
+          noteId: noteId
+        });
+      }
+
       delete global.activeMeetingIds[evt.window.id];
     }
 
@@ -513,60 +580,33 @@ function initSDK() {
   RecallAiSdk.addEventListener('recording-ended', async (evt) => {
     console.log("Recording ended:", evt);
 
-    // Log the SDK recording-ended event
+    if (coachingEngine.isActive()) {
+      console.log('Recording ended, deactivating coaching');
+      coachingEngine.deactivateCoaching();
+    }
+
     sdkLogger.logEvent('recording-ended', {
       windowId: evt.window.id
     });
 
     try {
-      // Update the note with recording information
       await updateNoteWithRecordingInfo(evt.window.id);
-
-      // Add a small delay before uploading (good practice for file system operations)
-      setTimeout(async () => {
-        try {
-          // Try to get a new upload token for the upload if needed
-          const uploadData = await createDesktopSdkUpload();
-
-          if (uploadData && uploadData.upload_token) {
-            console.log('Uploading recording with new upload token:', uploadData.upload_token);
-
-            // Log the uploadRecording API call
-            sdkLogger.logApiCall('uploadRecording', {
-              windowId: evt.window.id,
-              uploadToken: `${uploadData.upload_token.substring(0, 8)}...` // Log truncated token for security
-            });
-
-            RecallAiSdk.uploadRecording({
-              windowId: evt.window.id,
-              uploadToken: uploadData.upload_token
-            });
-          } else {
-            // Fallback to regular upload
-            console.log('Uploading recording without new token');
-
-            // Log the uploadRecording API call (fallback)
-            sdkLogger.logApiCall('uploadRecording', {
-              windowId: evt.window.id
-            });
-
-            RecallAiSdk.uploadRecording({ windowId: evt.window.id });
-          }
-        } catch (uploadError) {
-          console.error('Error during upload:', uploadError);
-          // Fallback to regular upload
-
-          // Log the uploadRecording API call (error fallback)
-          sdkLogger.logApiCall('uploadRecording', {
-            windowId: evt.window.id,
-            error: 'Fallback after error'
-          });
-
-          RecallAiSdk.uploadRecording({ windowId: evt.window.id });
-        }
-      }, 3000); // Wait 3 seconds before uploading
     } catch (error) {
       console.error("Error handling recording ended:", error);
+    }
+
+    let noteId = null;
+    if (global.activeMeetingIds && global.activeMeetingIds[evt.window.id]) {
+      noteId = global.activeMeetingIds[evt.window.id].noteId;
+    }
+    activeRecordings.removeRecording(evt.window.id);
+
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('recording-state-change', {
+        recordingId: evt.window.id,
+        state: 'idle',
+        noteId
+      });
     }
   });
 
@@ -574,66 +614,30 @@ function initSDK() {
     console.log("PERMISSIONS GRANTED");
   });
 
-  // Track upload progress
-  RecallAiSdk.addEventListener('upload-progress', async (evt) => {
-    const { progress, window } = evt;
-    console.log(`Upload progress: ${progress}%`);
+  RecallAiSdk.addEventListener('recording-started', async (evt) => {
+    console.log("Recording started for window:", evt.window?.id);
 
-    // Log the SDK upload-progress event
-    // sdkLogger.logEvent('upload-progress', {
-    //   windowId: window.id,
-    //   progress
-    // });
-
-    // Update the note with upload progress if needed
-    if (progress === 100) {
-      console.log(`Upload completed for recording: ${window.id}`);
-      // Could update the note here with upload completion status
-    }
-  });
-
-  // Track SDK state changes
-  RecallAiSdk.addEventListener('sdk-state-change', async (evt) => {
-    const { sdk: { state: { code } }, window } = evt;
-    console.log("Recording state changed:", code, "for window:", window?.id);
-
-    // Log the SDK sdk-state-change event
-    sdkLogger.logEvent('sdk-state-change', {
-      state: code,
-      windowId: window?.id
+    sdkLogger.logEvent('recording-started', {
+      windowId: evt.window?.id
     });
 
-    // Update recording state in our global tracker
-    if (window && window.id) {
-      // Get the meeting note ID associated with this window
-      let noteId = null;
-      if (global.activeMeetingIds && global.activeMeetingIds[window.id]) {
-        noteId = global.activeMeetingIds[window.id].noteId;
-      }
+    if (!evt.window || !evt.window.id) return;
 
-      // Update the recording state in our tracker
-      if (code === 'recording') {
-        console.log('Recording in progress...');
-        if (noteId) {
-          // If recording started, add it to our active recordings
-          activeRecordings.addRecording(window.id, noteId, window.platform || 'unknown');
-        }
-      } else if (code === 'paused') {
-        console.log('Recording paused');
-        activeRecordings.updateState(window.id, 'paused');
-      } else if (code === 'idle') {
-        console.log('Recording stopped');
-        activeRecordings.removeRecording(window.id);
-      }
+    let noteId = null;
+    if (global.activeMeetingIds && global.activeMeetingIds[evt.window.id]) {
+      noteId = global.activeMeetingIds[evt.window.id].noteId;
+    }
 
-      // Notify renderer process about recording state change
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('recording-state-change', {
-          recordingId: window.id,
-          state: code,
-          noteId
-        });
-      }
+    if (noteId) {
+      activeRecordings.addRecording(evt.window.id, noteId, evt.window.platform || 'unknown');
+    }
+
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('recording-state-change', {
+        recordingId: evt.window.id,
+        state: 'recording',
+        noteId
+      });
     }
   });
 
@@ -682,6 +686,29 @@ function initSDK() {
       body: `Error: ${type} - ${message}`
     });
     notification.show();
+  });
+
+  RecallAiSdk.addEventListener('network-status', async (evt) => {
+    const { status } = evt;
+    console.log("Network status:", status);
+
+    sdkLogger.logEvent('network-status', { status });
+
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('network-status-change', { status });
+    }
+
+    if (status === 'disconnected') {
+      new Notification({
+        title: 'Connection Lost',
+        body: 'Transcription may stall until the network reconnects.'
+      }).show();
+    } else if (status === 'reconnected') {
+      new Notification({
+        title: 'Reconnected',
+        body: 'Network connection restored.'
+      }).show();
+    }
   });
 }
 
@@ -788,9 +815,10 @@ ipcMain.handle('deleteMeeting', async (event, meetingId) => {
 });
 
 // Handle generating AI summary for a meeting (non-streaming)
-ipcMain.handle('generateMeetingSummary', async (event, meetingId) => {
+ipcMain.handle('generateMeetingSummary', async (event, params) => {
+  const { meetingId, summaryTypeId } = params;
   try {
-    console.log(`Manual summary generation requested for meeting: ${meetingId}`);
+    console.log(`Manual summary generation requested for meeting: ${meetingId}, summaryTypeId: ${summaryTypeId || 'default'}`);
 
     // Read current data
     const fileData = await fs.promises.readFile(meetingsFilePath, 'utf8');
@@ -817,7 +845,7 @@ ipcMain.handle('generateMeetingSummary', async (event, meetingId) => {
     console.log('Generating AI summary for meeting: ' + meetingId);
 
     // Generate the summary
-    const summary = await generateMeetingSummary(meeting);
+    const result = await generateMeetingSummary(meeting, null, summaryTypeId);
 
     // Get meeting title for use in the new content
     const meetingTitle = meeting.title || "Meeting Notes";
@@ -851,7 +879,7 @@ ipcMain.handle('generateMeetingSummary', async (event, meetingId) => {
     }
 
     // Create content with the AI-generated summary
-    meeting.content = `# ${meetingTitle}\n\n${summary}`;
+    meeting.content = `# ${meetingTitle}\n\n${result.summary}`;
 
     // If video exists, store the path separately but don't add it to the content
     if (videoExists) {
@@ -862,6 +890,8 @@ ipcMain.handle('generateMeetingSummary', async (event, meetingId) => {
     }
 
     meeting.hasSummary = true;
+    meeting.summaryTypeId = result.summaryTypeId;
+    meeting.summaryTypeName = result.summaryTypeName;
 
     // Save the updated data with summary
     await fileOperationManager.writeData(meetingsData);
@@ -875,10 +905,42 @@ ipcMain.handle('generateMeetingSummary', async (event, meetingId) => {
 
     return {
       success: true,
-      summary
+      summary: result.summary,
+      summaryTypeId: result.summaryTypeId,
+      summaryTypeName: result.summaryTypeName
     };
   } catch (error) {
     console.error('Error generating meeting summary:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Handle asking a question about a meeting transcript
+ipcMain.handle('askMeetingQuestion', async (event, { meetingId, question }) => {
+  try {
+    console.log(`Q&A requested for meeting: ${meetingId}, question: ${question}`);
+
+    // Read current data
+    const fileData = await fs.promises.readFile(meetingsFilePath, 'utf8');
+    const meetingsData = JSON.parse(fileData);
+
+    // Find the meeting
+    const meeting = meetingsData.pastMeetings.find(m => m.id === meetingId);
+
+    if (!meeting) {
+      return { success: false, error: 'Meeting not found' };
+    }
+
+    if (!meeting.transcript || meeting.transcript.length === 0) {
+      return { success: false, error: 'No transcript available for this meeting' };
+    }
+
+    // Generate the answer
+    const result = await askQuestionAboutMeeting(meeting, question);
+
+    return { success: true, answer: result.answer };
+  } catch (error) {
+    console.error('Error asking meeting question:', error);
     return { success: false, error: error.message };
   }
 });
@@ -996,9 +1058,10 @@ ipcMain.handle('stopManualRecording', async (event, recordingId) => {
 });
 
 // Handle generating AI summary with streaming
-ipcMain.handle('generateMeetingSummaryStreaming', async (event, meetingId) => {
+ipcMain.handle('generateMeetingSummaryStreaming', async (event, params) => {
+  const { meetingId, summaryTypeId } = params;
   try {
-    console.log(`Streaming summary generation requested for meeting: ${meetingId}`);
+    console.log(`Streaming summary generation requested for meeting: ${meetingId}, summaryTypeId: ${summaryTypeId || 'default'}`);
 
     // Read current data
     const fileData = await fs.promises.readFile(meetingsFilePath, 'utf8');
@@ -1057,11 +1120,13 @@ ipcMain.handle('generateMeetingSummaryStreaming', async (event, meetingId) => {
     };
 
     // Generate summary with streaming
-    const summary = await generateMeetingSummary(meeting, streamProgress);
+    const result = await generateMeetingSummary(meeting, streamProgress, summaryTypeId);
 
     // Make sure the final content is set correctly
-    meeting.content = `# ${meetingTitle}\n\n${summary}`;
+    meeting.content = `# ${meetingTitle}\n\n${result.summary}`;
     meeting.hasSummary = true;
+    meeting.summaryTypeId = result.summaryTypeId;
+    meeting.summaryTypeName = result.summaryTypeName;
 
     // Save the updated data with summary
     await fileOperationManager.writeData(meetingsData);
@@ -1073,7 +1138,9 @@ ipcMain.handle('generateMeetingSummaryStreaming', async (event, meetingId) => {
 
     return {
       success: true,
-      summary
+      summary: result.summary,
+      summaryTypeId: result.summaryTypeId,
+      summaryTypeName: result.summaryTypeName
     };
   } catch (error) {
     console.error('Error generating streaming summary:', error);
@@ -1507,20 +1574,75 @@ async function processTranscriptData(evt) {
     });
 
     console.log(`Processed transcript data for meeting: ${noteId}`);
+
+    // Send transcript to coaching engine if active for this meeting
+    if (coachingEngine.isActive() && coachingEngine.getCurrentMeetingId() === noteId) {
+      coachingEngine.appendTranscript({
+        text,
+        speaker,
+        timestamp: new Date().toISOString()
+      });
+    }
   } catch (error) {
     console.error('Error processing transcript data:', error);
   }
 }
 
+// Default built-in system prompt for summary generation
+const DEFAULT_SUMMARY_SYSTEM_PROMPT =
+  "You are an AI assistant that summarizes meeting transcripts. " +
+  "You MUST format your response using the following structure:\n\n" +
+  "# Participants\n" +
+  "- [List all participants mentioned in the transcript]\n\n" +
+  "# Summary\n" +
+  "- [Key discussion point 1]\n" +
+  "- [Key discussion point 2]\n" +
+  "- [Key decisions made]\n" +
+  "- [Include any important deadlines or dates mentioned]\n\n" +
+  "# Action Items\n" +
+  "- [Action item 1] - [Responsible person if mentioned]\n" +
+  "- [Action item 2] - [Responsible person if mentioned]\n" +
+  "- [Add any other action items discussed]\n\n" +
+  "Stick strictly to this format with these exact section headers. Keep each bullet point concise but informative.";
+
 // Function to generate AI summary from transcript with streaming support
-async function generateMeetingSummary(meeting, progressCallback = null) {
+async function generateMeetingSummary(meeting, progressCallback = null, summaryTypeId = null) {
   try {
     if (!meeting.transcript || meeting.transcript.length === 0) {
       console.log('No transcript available to summarize');
-      return 'No transcript available to summarize.';
+      return { summary: 'No transcript available to summarize.', summaryTypeId: null, summaryTypeName: null };
     }
 
     console.log(`Generating AI summary for meeting: ${meeting.id}`);
+
+    // Determine which system message to use
+    let systemMessage = DEFAULT_SUMMARY_SYSTEM_PROMPT;
+    let usedSummaryTypeId = null;
+    let usedSummaryTypeName = null;
+
+    // Try to use the provided summaryTypeId
+    if (summaryTypeId) {
+      const summaryType = await summaryManager.getSummaryTypeById(summaryTypeId);
+      if (summaryType) {
+        systemMessage = summaryType.systemPrompt;
+        usedSummaryTypeId = summaryType.id;
+        usedSummaryTypeName = summaryType.name;
+        console.log(`Using custom summary type: ${summaryType.name}`);
+      }
+    }
+
+    // If no summaryTypeId or type not found, try to use the default
+    if (!usedSummaryTypeId) {
+      const defaultType = await summaryManager.getDefaultSummaryType();
+      if (defaultType) {
+        systemMessage = defaultType.systemPrompt;
+        usedSummaryTypeId = defaultType.id;
+        usedSummaryTypeName = defaultType.name;
+        console.log(`Using default summary type: ${defaultType.name}`);
+      } else {
+        console.log('Using built-in summary prompt');
+      }
+    }
 
     // Format the transcript into a single text for the AI to process
     const transcriptText = meeting.transcript.map(entry =>
@@ -1534,23 +1656,6 @@ async function generateMeetingSummary(meeting, progressCallback = null) {
         `- ${p.name}${p.isHost ? ' (Host)' : ''}`
       ).join('\n');
     }
-
-    // Define a system prompt to guide the AI's response with a specific format
-    const systemMessage =
-      "You are an AI assistant that summarizes meeting transcripts. " +
-      "You MUST format your response using the following structure:\n\n" +
-      "# Participants\n" +
-      "- [List all participants mentioned in the transcript]\n\n" +
-      "# Summary\n" +
-      "- [Key discussion point 1]\n" +
-      "- [Key discussion point 2]\n" +
-      "- [Key decisions made]\n" +
-      "- [Include any important deadlines or dates mentioned]\n\n" +
-      "# Action Items\n" +
-      "- [Action item 1] - [Responsible person if mentioned]\n" +
-      "- [Action item 2] - [Responsible person if mentioned]\n" +
-      "- [Add any other action items discussed]\n\n" +
-      "Stick strictly to this format with these exact section headers. Keep each bullet point concise but informative.";
 
     // Prepare the messages array for the API
     const messages = [
@@ -1579,8 +1684,12 @@ ${transcriptText}`
       // Log which model was actually used
       console.log(`AI summary generated successfully using model: ${response.model}`);
 
-      // Return the generated summary
-      return response.choices[0].message.content;
+      // Return the generated summary with type info
+      return {
+        summary: response.choices[0].message.content,
+        summaryTypeId: usedSummaryTypeId,
+        summaryTypeName: usedSummaryTypeName
+      };
     } else {
       // Use streaming version and accumulate the response
       let fullText = '';
@@ -1634,7 +1743,11 @@ ${transcriptText}`
             }
 
             console.log('AI summary streaming completed');
-            resolve(fullText);
+            resolve({
+              summary: fullText,
+              summaryTypeId: usedSummaryTypeId,
+              summaryTypeName: usedSummaryTypeName
+            });
           } catch (error) {
             console.error('Stream error:', error);
             reject(error);
@@ -1647,14 +1760,51 @@ ${transcriptText}`
 
     // Check if it's an OpenRouter/OpenAI specific error
     if (error.status) {
-      return `Error generating summary: API returned status ${error.status}: ${error.message}`;
+      return { summary: `Error generating summary: API returned status ${error.status}: ${error.message}`, summaryTypeId: null, summaryTypeName: null };
     } else if (error.response) {
       // Handle errors with a response object
-      return `Error generating summary: ${error.response.status} - ${error.response.data?.error?.message || error.message}`;
+      return { summary: `Error generating summary: ${error.response.status} - ${error.response.data?.error?.message || error.message}`, summaryTypeId: null, summaryTypeName: null };
     } else {
       // Default error handling
-      return `Error generating summary: ${error.message}`;
+      return { summary: `Error generating summary: ${error.message}`, summaryTypeId: null, summaryTypeName: null };
     }
+  }
+}
+
+// Function to ask a question about a meeting transcript
+async function askQuestionAboutMeeting(meeting, question) {
+  try {
+    if (!meeting.transcript || meeting.transcript.length === 0) {
+      console.log('No transcript available for Q&A');
+      return { answer: 'No transcript available to answer questions.' };
+    }
+
+    console.log(`Asking question about meeting: ${meeting.id}`);
+
+    // Format the transcript into a single text
+    const transcriptText = meeting.transcript.map(entry =>
+      `${entry.speaker}: ${entry.text}`
+    ).join('\n');
+
+    const systemMessage = `You are a helpful assistant answering questions about a meeting transcript.
+Be concise and direct. Only answer based on what's in the transcript.
+If the answer isn't in the transcript, say so.`;
+
+    const response = await openai.chat.completions.create({
+      model: 'anthropic/claude-haiku-4.5',
+      messages: [
+        { role: 'system', content: systemMessage },
+        { role: 'user', content: `Meeting transcript:\n${transcriptText}\n\nQuestion: ${question}` }
+      ],
+      max_tokens: 500,
+      temperature: 0.3
+    });
+
+    console.log('Q&A response generated successfully');
+    return { answer: response.choices[0].message.content };
+  } catch (error) {
+    console.error('Error asking question about meeting:', error);
+    return { answer: `Error: ${error.message}` };
   }
 }
 
@@ -1744,7 +1894,8 @@ async function updateNoteWithRecordingInfo(recordingId) {
       };
 
       // Generate the summary with streaming updates
-      const summary = await generateMeetingSummary(meeting, streamProgress);
+      // Use the meeting's selected summary type if available
+      const summaryResult = await generateMeetingSummary(meeting, streamProgress, meeting.summaryTypeId || null);
 
       // Check for different possible video file patterns
       const possibleFilePaths = [
@@ -1774,7 +1925,7 @@ async function updateNoteWithRecordingInfo(recordingId) {
       console.log("Attempting to embed video file", videoFilePath);
 
       // Set the content to just the summary
-      meeting.content = `${summary}`;
+      meeting.content = `${summaryResult.summary}`;
 
       // If video exists, store the path separately but don't add it to the content
       if (videoExists) {
@@ -1785,6 +1936,8 @@ async function updateNoteWithRecordingInfo(recordingId) {
       }
 
       meeting.hasSummary = true;
+      meeting.summaryTypeId = summaryResult.summaryTypeId;
+      meeting.summaryTypeName = summaryResult.summaryTypeName;
 
       // Save the updated data with summary
       await fileOperationManager.writeData(meetingsData);
@@ -1868,3 +2021,446 @@ async function joinDetectedMeeting() {
     return { success: false, error: error.message };
   }
 }
+
+// ============= Bot Management IPC Handlers =============
+
+// Get all bot types
+ipcMain.handle('getBotTypes', async () => {
+  try {
+    const botTypes = await botManager.getBotTypes();
+    return { success: true, data: botTypes };
+  } catch (error) {
+    console.error('Error getting bot types:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Get a single bot type by ID
+ipcMain.handle('getBotTypeById', async (event, botId) => {
+  try {
+    const botType = await botManager.getBotTypeById(botId);
+    return { success: true, data: botType };
+  } catch (error) {
+    console.error('Error getting bot type:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Create a new bot type
+ipcMain.handle('createBotType', async (event, botData) => {
+  try {
+    const newBot = await botManager.createBotType(botData);
+    return { success: true, data: newBot };
+  } catch (error) {
+    console.error('Error creating bot type:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Update an existing bot type
+ipcMain.handle('updateBotType', async (event, { botId, updates }) => {
+  try {
+    const updatedBot = await botManager.updateBotType(botId, updates);
+    return { success: true, data: updatedBot };
+  } catch (error) {
+    console.error('Error updating bot type:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Delete a bot type
+ipcMain.handle('deleteBotType', async (event, botId) => {
+  try {
+    await botManager.deleteBotType(botId);
+    return { success: true };
+  } catch (error) {
+    console.error('Error deleting bot type:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Get global settings
+ipcMain.handle('getGlobalSettings', async () => {
+  try {
+    const settings = await botManager.getGlobalSettings();
+    return { success: true, data: settings };
+  } catch (error) {
+    console.error('Error getting global settings:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Update global settings
+ipcMain.handle('updateGlobalSettings', async (event, updates) => {
+  try {
+    const settings = await botManager.updateGlobalSettings(updates);
+    return { success: true, data: settings };
+  } catch (error) {
+    console.error('Error updating global settings:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Get available models for bot configuration
+ipcMain.handle('getAvailableModels', async () => {
+  try {
+    const models = botManager.getAvailableModels();
+    return { success: true, data: models };
+  } catch (error) {
+    console.error('Error getting available models:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// ============= Tag Management IPC Handlers =============
+
+// Get all tags
+ipcMain.handle('getTags', async () => {
+  try {
+    const tags = await tagManager.getTags();
+    return { success: true, data: tags };
+  } catch (error) {
+    console.error('Error getting tags:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Get tag by ID
+ipcMain.handle('getTagById', async (event, tagId) => {
+  try {
+    const tag = await tagManager.getTagById(tagId);
+    return { success: true, data: tag };
+  } catch (error) {
+    console.error('Error getting tag by ID:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Create a new tag
+ipcMain.handle('createTag', async (event, tagData) => {
+  try {
+    const newTag = await tagManager.createTag(tagData);
+    return { success: true, data: newTag };
+  } catch (error) {
+    console.error('Error creating tag:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Update a tag
+ipcMain.handle('updateTag', async (event, { tagId, updates }) => {
+  try {
+    const updatedTag = await tagManager.updateTag(tagId, updates);
+    return { success: true, data: updatedTag };
+  } catch (error) {
+    console.error('Error updating tag:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Delete a tag (also removes from all meetings)
+ipcMain.handle('deleteTag', async (event, tagId) => {
+  try {
+    await tagManager.deleteTag(tagId);
+    // Also remove tag from all meetings
+    await fileOperationManager.scheduleOperation(async (meetingsData) => {
+      meetingsData.pastMeetings.forEach(meeting => {
+        if (meeting.tagIds) {
+          meeting.tagIds = meeting.tagIds.filter(id => id !== tagId);
+        }
+      });
+      meetingsData.upcomingMeetings.forEach(meeting => {
+        if (meeting.tagIds) {
+          meeting.tagIds = meeting.tagIds.filter(id => id !== tagId);
+        }
+      });
+      return meetingsData;
+    });
+    return { success: true };
+  } catch (error) {
+    console.error('Error deleting tag:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Get available tag colors
+ipcMain.handle('getTagColors', async () => {
+  try {
+    const colors = tagManager.getTagColors();
+    return { success: true, data: colors };
+  } catch (error) {
+    console.error('Error getting tag colors:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Add tag to meeting
+ipcMain.handle('addTagToMeeting', async (event, { meetingId, tagId }) => {
+  try {
+    await fileOperationManager.scheduleOperation(async (meetingsData) => {
+      const meeting = meetingsData.pastMeetings.find(m => m.id === meetingId) ||
+                      meetingsData.upcomingMeetings.find(m => m.id === meetingId);
+      if (meeting) {
+        if (!meeting.tagIds) {
+          meeting.tagIds = [];
+        }
+        if (!meeting.tagIds.includes(tagId)) {
+          meeting.tagIds.push(tagId);
+        }
+      }
+      return meetingsData;
+    });
+    return { success: true };
+  } catch (error) {
+    console.error('Error adding tag to meeting:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Remove tag from meeting
+ipcMain.handle('removeTagFromMeeting', async (event, { meetingId, tagId }) => {
+  try {
+    await fileOperationManager.scheduleOperation(async (meetingsData) => {
+      const meeting = meetingsData.pastMeetings.find(m => m.id === meetingId) ||
+                      meetingsData.upcomingMeetings.find(m => m.id === meetingId);
+      if (meeting && meeting.tagIds) {
+        meeting.tagIds = meeting.tagIds.filter(id => id !== tagId);
+      }
+      return meetingsData;
+    });
+    return { success: true };
+  } catch (error) {
+    console.error('Error removing tag from meeting:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// ============= Coaching IPC Handlers =============
+
+// Activate coaching bot
+ipcMain.handle('activateCoachingBot', async (event, { botType, meetingId }) => {
+  try {
+    const result = await coachingEngine.activateCoaching(botType, meetingId, mainWindow);
+    return { success: true, data: result };
+  } catch (error) {
+    console.error('Error activating coaching bot:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Deactivate coaching bot
+ipcMain.handle('deactivateCoachingBot', async () => {
+  try {
+    const result = coachingEngine.deactivateCoaching();
+    return { success: true, data: result };
+  } catch (error) {
+    console.error('Error deactivating coaching bot:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// ============= Summary Type Management IPC Handlers =============
+
+// Get all summary types
+ipcMain.handle('getSummaryTypes', async () => {
+  try {
+    const summaryTypes = await summaryManager.getSummaryTypes();
+    return { success: true, data: summaryTypes };
+  } catch (error) {
+    console.error('Error getting summary types:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Get a single summary type by ID
+ipcMain.handle('getSummaryTypeById', async (event, typeId) => {
+  try {
+    const summaryType = await summaryManager.getSummaryTypeById(typeId);
+    return { success: true, data: summaryType };
+  } catch (error) {
+    console.error('Error getting summary type:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Create a new summary type
+ipcMain.handle('createSummaryType', async (event, typeData) => {
+  try {
+    const newType = await summaryManager.createSummaryType(typeData);
+    return { success: true, data: newType };
+  } catch (error) {
+    console.error('Error creating summary type:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Update an existing summary type
+ipcMain.handle('updateSummaryType', async (event, { typeId, updates }) => {
+  try {
+    const updatedType = await summaryManager.updateSummaryType(typeId, updates);
+    return { success: true, data: updatedType };
+  } catch (error) {
+    console.error('Error updating summary type:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Delete a summary type
+ipcMain.handle('deleteSummaryType', async (event, typeId) => {
+  try {
+    await summaryManager.deleteSummaryType(typeId);
+    return { success: true };
+  } catch (error) {
+    console.error('Error deleting summary type:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Get summary global settings
+ipcMain.handle('getSummaryGlobalSettings', async () => {
+  try {
+    const settings = await summaryManager.getSummaryGlobalSettings();
+    return { success: true, data: settings };
+  } catch (error) {
+    console.error('Error getting summary global settings:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Update summary global settings
+ipcMain.handle('updateSummaryGlobalSettings', async (event, updates) => {
+  try {
+    const settings = await summaryManager.updateSummaryGlobalSettings(updates);
+    return { success: true, data: settings };
+  } catch (error) {
+    console.error('Error updating summary global settings:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Get default summary type
+ipcMain.handle('getDefaultSummaryType', async () => {
+  try {
+    const defaultType = await summaryManager.getDefaultSummaryType();
+    return { success: true, data: defaultType };
+  } catch (error) {
+    console.error('Error getting default summary type:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Delete all recordings from Recall.ai
+ipcMain.handle('deleteAllRecordings', async () => {
+  const apiUrl = process.env.RECALLAI_API_URL || 'https://us-west-2.recall.ai';
+  const apiKey = process.env.RECALLAI_API_KEY;
+
+  if (!apiKey) {
+    return { success: false, error: 'RECALLAI_API_KEY is not configured' };
+  }
+
+  try {
+    let deletedCount = 0;
+    let nextUrl = `${apiUrl}/api/v1/recording/`;
+
+    // Paginate through all recordings
+    while (nextUrl) {
+      const listResponse = await axios.get(nextUrl, {
+        headers: { 'Authorization': `Token ${apiKey}` },
+        timeout: 30000
+      });
+
+      const recordings = listResponse.data.results || [];
+
+      // Delete each recording
+      for (const recording of recordings) {
+        try {
+          await axios.delete(`${apiUrl}/api/v1/recording/${recording.id}/`, {
+            headers: { 'Authorization': `Token ${apiKey}` },
+            timeout: 10000
+          });
+          deletedCount++;
+          console.log(`Deleted recording: ${recording.id}`);
+        } catch (deleteError) {
+          console.error(`Failed to delete recording ${recording.id}:`, deleteError.message);
+        }
+      }
+
+      // Get next page URL
+      nextUrl = listResponse.data.next;
+    }
+
+    console.log(`Successfully deleted ${deletedCount} recording(s)`);
+    return { success: true, deleted: deletedCount };
+  } catch (error) {
+    console.error('Error deleting recordings:', error.message);
+    return { success: false, error: error.message };
+  }
+});
+
+// Clear local recordings (delete all .mp4 files from recordings folder)
+ipcMain.handle('clearLocalRecordings', async () => {
+  try {
+    const recordingsDir = path.join(app.getPath('userData'), 'recordings');
+
+    if (!fs.existsSync(recordingsDir)) {
+      return { success: true, deleted: 0 };
+    }
+
+    const files = await fs.promises.readdir(recordingsDir);
+    const mp4Files = files.filter(file => file.endsWith('.mp4'));
+
+    let deletedCount = 0;
+    for (const file of mp4Files) {
+      try {
+        await fs.promises.unlink(path.join(recordingsDir, file));
+        deletedCount++;
+        console.log(`Deleted local recording: ${file}`);
+      } catch (err) {
+        console.error(`Failed to delete ${file}:`, err.message);
+      }
+    }
+
+    console.log(`Successfully deleted ${deletedCount} local recording(s)`);
+    return { success: true, deleted: deletedCount };
+  } catch (error) {
+    console.error('Error clearing local recordings:', error.message);
+    return { success: false, error: error.message };
+  }
+});
+
+// Open video file in system default player
+ipcMain.handle('openVideoFile', async (event, meetingId) => {
+  try {
+    // Read meetings data to find the video path
+    const meetingsFilePath = path.join(app.getPath('userData'), 'meetings.json');
+    const fileData = await fs.promises.readFile(meetingsFilePath, 'utf8');
+    const meetingsData = JSON.parse(fileData);
+
+    // Find the meeting
+    const meeting = meetingsData.pastMeetings.find(m => m.id === meetingId);
+    if (!meeting) {
+      return { success: false, error: 'Meeting not found' };
+    }
+
+    if (!meeting.videoPath) {
+      return { success: false, error: 'No video recording for this meeting' };
+    }
+
+    // Check if file exists
+    if (!fs.existsSync(meeting.videoPath)) {
+      return { success: false, error: 'Video file not found on disk' };
+    }
+
+    // Open with system default application
+    const result = await shell.openPath(meeting.videoPath);
+    if (result) {
+      // shell.openPath returns an error string if it fails, empty string on success
+      return { success: false, error: result };
+    }
+
+    return { success: true };
+  } catch (error) {
+    console.error('Error opening video file:', error.message);
+    return { success: false, error: error.message };
+  }
+});

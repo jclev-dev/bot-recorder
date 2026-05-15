@@ -6,7 +6,9 @@ module.exports = {
     asar: {
       unpackDir: "node_modules/@recallai"
     },
+    extraResource: ['.env'],
     osxSign: {
+      identity: "Apple Development: Jordan Clevenger (Y54879CT78)",
       continueOnError: false,
       optionsForFile: (_) => {
         // Here, we keep it simple and return a single entitlements.plist file.
@@ -17,7 +19,7 @@ module.exports = {
         };
       }
     },
-    icon: './muesli',
+    icon: './meetingbot',
     extendInfo: {
       NSUserNotificationAlertStyle: "alert",
     }
@@ -52,6 +54,7 @@ module.exports = {
     {
       name: '@electron-forge/plugin-webpack',
       config: {
+        port: 9001,
         devContentSecurityPolicy: "default-src * 'unsafe-inline' 'unsafe-eval' data: blob: filesystem: mediastream: file:;",
         mainConfig: './webpack.main.config.js',
         renderer: {
@@ -72,7 +75,7 @@ module.exports = {
     {
       name: "@timfish/forge-externals-plugin",
       config: {
-        externals: ["@recallai/desktop-sdk"],
+        externals: ["@recallai/desktop-sdk", "express", "axios"],
         includeDeps: true
       }
     },

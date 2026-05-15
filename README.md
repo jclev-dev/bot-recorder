@@ -1,4 +1,4 @@
-# Muesli
+# Meeting Bot
 
 This is a demo application that shows off what you can build with the [Recall.ai Desktop Recording SDK.](https://www.recall.ai/product/desktop-recording-sdk)
 
@@ -25,7 +25,7 @@ If you want to enable the AI summary after a recording is finished, you can spec
 OPENROUTER_KEY=<your key>
 ```
 
-To launch the Muesli application, start the server first, then the app:
+To launch the Meeting Bot application, start the server first, then the app:
 
 ```sh
 npm ci

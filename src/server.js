@@ -2,25 +2,30 @@ const express = require('express');
 const axios = require('axios');
 const app = express();
 
-require('dotenv').config();
-
-// API configuration for Recall.ai
-const RECALLAI_API_URL = process.env.RECALLAI_API_URL || 'https://api.recall.ai';
-const RECALLAI_API_KEY = process.env.RECALLAI_API_KEY;
+// Note: dotenv is loaded by main.js AFTER this module is required
+// So we must read env vars inside route handlers, not at module load time
 
 app.get('/start-recording', async (req, res) => {
-    console.log(`Creating upload token with API key: ${RECALLAI_API_KEY.slice(0,4)}...`);
+    // Read env vars at request time (after dotenv has been loaded)
+    const RECALLAI_API_URL = process.env.RECALLAI_API_URL || 'https://api.recall.ai';
+    const RECALLAI_API_KEY = process.env.RECALLAI_API_KEY;
 
     if (!RECALLAI_API_KEY) {
         console.error("RECALLAI_API_KEY is missing! Set it in .env file");
         return res.json({ status: 'error', message: 'RECALLAI_API_KEY is missing' });
     }
 
+    console.log(`Creating upload token with API key: ${RECALLAI_API_KEY.slice(0,4)}...`);
+
     const url = `${RECALLAI_API_URL}/api/v1/sdk_upload/`;
 
     try {
         const response = await axios.post(url, {
             recording_config: {
+                retention: {
+                    type: "timed",
+                    hours: 168  // 7 days
+                },
                 transcript: {
                     provider: {
                         assembly_ai_v3_streaming: {}

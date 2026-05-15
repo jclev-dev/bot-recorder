@@ -7,6 +7,16 @@
  */
 
 import './index.css';
+import { marked } from 'marked';
+
+// Configure marked options for better rendering
+marked.setOptions({
+  breaks: true,  // Convert \n to <br>
+  gfm: true      // GitHub Flavored Markdown
+});
+
+// Global preview mode state
+window.isPreviewMode = false;
 
 // Create empty meetings data structure to be filled from the file
 const meetingsData = {
@@ -24,6 +34,89 @@ let pastMeetingsByDate = {};
 // Global recording state variables
 window.isRecording = false;
 window.currentRecordingId = null;
+
+// Global coaching state variables
+window.activeCoachingBot = null;
+window.availableModels = [];
+window.botTypes = [];
+
+// Global summary state variables
+window.summaryTypes = [];
+window.selectedSummaryTypeId = null;  // Currently selected summary type for the meeting
+
+// Global tag state variables
+window.tags = [];
+window.tagColors = [];
+window.selectedTagFilter = null;  // null = "All Notes", otherwise tag ID
+
+// Avatar color palette for participant initials
+const AVATAR_COLORS = [
+  '#6366F1', // Indigo
+  '#EC4899', // Pink
+  '#10B981', // Emerald
+  '#F59E0B', // Amber
+  '#8B5CF6', // Violet
+  '#EF4444', // Red
+  '#06B6D4', // Cyan
+  '#84CC16', // Lime
+];
+
+/**
+ * Extract initials from a participant name
+ * @param {string} name - Full name like "John Doe" or "John"
+ * @returns {string} Initials like "JD" or "J"
+ */
+function getInitials(name) {
+  if (!name || typeof name !== 'string') return '?';
+
+  const parts = name.trim().split(/\s+/);
+  if (parts.length >= 2) {
+    return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
+  }
+  return parts[0].substring(0, 2).toUpperCase();
+}
+
+/**
+ * Get a consistent color for a participant based on their ID or name
+ * @param {string} identifier - Participant ID or name
+ * @param {number} index - Fallback index
+ * @returns {string} Hex color code
+ */
+function getAvatarColor(identifier, index) {
+  let hash = 0;
+  const str = identifier || String(index);
+  for (let i = 0; i < str.length; i++) {
+    hash = str.charCodeAt(i) + ((hash << 5) - hash);
+  }
+  return AVATAR_COLORS[Math.abs(hash) % AVATAR_COLORS.length];
+}
+
+/**
+ * Generate HTML for avatar group
+ * @param {Array} participants - Array of participant objects
+ * @param {number} maxVisible - Maximum avatars to show before overflow
+ * @returns {string} HTML string for avatar group
+ */
+function createAvatarGroup(participants, maxVisible = 3) {
+  if (!participants || participants.length === 0) {
+    return '';
+  }
+
+  const visibleParticipants = participants.slice(0, maxVisible);
+  const overflowCount = participants.length - maxVisible;
+
+  let avatarsHtml = visibleParticipants.map((p, index) => {
+    const initials = getInitials(p.name);
+    const color = getAvatarColor(p.id || p.name, index);
+    return `<div class="avatar" style="background-color: ${color};" title="${p.name}">${initials}</div>`;
+  }).join('');
+
+  if (overflowCount > 0) {
+    avatarsHtml += `<div class="avatar avatar-overflow" title="${overflowCount} more participants">+${overflowCount}</div>`;
+  }
+
+  return `<div class="avatar-group">${avatarsHtml}</div>`;
+}
 
 
 // Function to check if there's an active recording for the current note
@@ -250,13 +343,29 @@ function createMeetingCard(meeting) {
     ? `<div class="meeting-time"><a class="meeting-demo-link">${meeting.subtitle}</a></div>`
     : `<div class="meeting-time">${meeting.subtitle}</div>`;
 
+  // Create tag chips HTML
+  let tagChipsHtml = '';
+  if (meeting.tagIds && meeting.tagIds.length > 0) {
+    const meetingTags = window.tags.filter(t => meeting.tagIds.includes(t.id));
+    tagChipsHtml = `<div class="meeting-tags">${meetingTags.map(t =>
+      `<span class="tag-chip tag-chip-small" style="background-color: ${t.color}">${t.name}</span>`
+    ).join('')}</div>`;
+  }
+
   card.innerHTML = `
     ${iconHtml}
     <div class="meeting-content">
       <div class="meeting-title">${meeting.title}</div>
       ${subtitleHtml}
+      ${tagChipsHtml}
     </div>
+    ${createAvatarGroup(meeting.participants, 3)}
     <div class="meeting-actions">
+      <button class="tag-meeting-btn" data-id="${meeting.id}" title="Add tags">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M21.41 11.58l-9-9C12.05 2.22 11.55 2 11 2H4c-1.1 0-2 .9-2 2v7c0 .55.22 1.05.59 1.42l9 9c.36.36.86.58 1.41.58.55 0 1.05-.22 1.41-.59l7-7c.37-.36.59-.86.59-1.41 0-.55-.23-1.06-.59-1.42zM5.5 7C4.67 7 4 6.33 4 5.5S4.67 4 5.5 4 7 4.67 7 5.5 6.33 7 5.5 7z" fill="currentColor"/>
+        </svg>
+      </button>
       <button class="delete-meeting-btn" data-id="${meeting.id}" title="Delete note">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
           <path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z" fill="currentColor"/>
@@ -270,8 +379,9 @@ function createMeetingCard(meeting) {
 
 // Function to show home view
 function showHomeView() {
-  document.getElementById('homeView').style.display = 'block';
+  document.getElementById('homeView').style.display = 'flex';
   document.getElementById('editorView').style.display = 'none';
+  document.getElementById('settingsView').style.display = 'none';
   document.getElementById('backButton').style.display = 'none';
   document.getElementById('newNoteBtn').style.display = 'block';
   document.getElementById('toggleSidebar').style.display = 'none';
@@ -292,6 +402,20 @@ function showHomeView() {
   }
 }
 
+// Function to show settings view
+function showSettingsView() {
+  document.getElementById('homeView').style.display = 'none';
+  document.getElementById('editorView').style.display = 'none';
+  document.getElementById('settingsView').style.display = 'block';
+  document.getElementById('backButton').style.display = 'block';
+  document.getElementById('newNoteBtn').style.display = 'none';
+  document.getElementById('joinMeetingBtn').style.display = 'none';
+  document.getElementById('toggleSidebar').style.display = 'none';
+
+  // Load settings data
+  loadSettingsData();
+}
+
 // Function to show editor view
 function showEditorView(meetingId) {
   console.log(`Showing editor view for meeting ID: ${meetingId}`);
@@ -309,6 +433,24 @@ function showEditorView(meetingId) {
     joinMeetingBtn.style.display = 'none';
   }
 
+  // Reset preview mode when switching notes
+  window.isPreviewMode = false;
+  const markdownPreview = document.getElementById('markdown-preview');
+  const simpleEditor = document.getElementById('simple-editor');
+  const editorModeToggle = document.getElementById('editorModeToggle');
+
+  if (markdownPreview) markdownPreview.style.display = 'none';
+  if (simpleEditor) simpleEditor.style.display = 'block';
+  if (editorModeToggle) {
+    const previewIcon = editorModeToggle.querySelector('.preview-icon');
+    const editIcon = editorModeToggle.querySelector('.edit-icon');
+    const toggleLabel = editorModeToggle.querySelector('.toggle-label');
+    if (previewIcon) previewIcon.style.display = 'block';
+    if (editIcon) editIcon.style.display = 'none';
+    if (toggleLabel) toggleLabel.textContent = 'Preview';
+    editorModeToggle.classList.remove('active');
+  }
+
   // Find the meeting in either upcoming or past meetings
   let meeting = [...upcomingMeetings, ...pastMeetings].find(m => m.id === meetingId);
 
@@ -321,7 +463,9 @@ function showEditorView(meetingId) {
   currentEditingMeetingId = meetingId;
   console.log(`Now editing meeting: ${meetingId} - ${meeting.title}`);
 
-
+  // Initialize summary type selection from meeting data
+  window.selectedSummaryTypeId = meeting.summaryTypeId || null;
+  updateSummarySelectorLabel();
 
   // Set the meeting title
   document.getElementById('noteTitle').textContent = meeting.title;
@@ -329,6 +473,9 @@ function showEditorView(meetingId) {
   // Set the date display
   const dateObj = new Date(meeting.date);
   document.getElementById('noteDate').textContent = formatDate(dateObj);
+
+  // Render tags in the editor
+  renderEditorTags(meeting);
 
   // Get the editor element
   const editorElement = document.getElementById('simple-editor');
@@ -364,6 +511,16 @@ function showEditorView(meetingId) {
     // Check if this note has an active recording and update the record button
     checkActiveRecordingState();
 
+    // Show/hide AI chat button based on whether transcript exists
+    const aiChatBtn = document.getElementById('openAiChatBtn');
+    if (aiChatBtn) {
+      if (meeting.transcript && meeting.transcript.length > 0) {
+        aiChatBtn.style.display = 'flex';
+      } else {
+        aiChatBtn.style.display = 'none';
+      }
+    }
+
     // Update debug panel with any available data if it's open
     const debugPanel = document.getElementById('debugPanel');
     if (debugPanel && !debugPanel.classList.contains('hidden')) {
@@ -396,6 +553,18 @@ function showEditorView(meetingId) {
           `;
         }
       }
+
+      // Show/hide transcript sidebar section based on whether transcript exists
+      const transcriptSidebarSection = document.getElementById('transcriptSidebarSection');
+      if (transcriptSidebarSection) {
+        if (meeting.transcript && meeting.transcript.length > 0) {
+          transcriptSidebarSection.style.display = 'block';
+        } else {
+          transcriptSidebarSection.style.display = 'none';
+        }
+      }
+
+      // Transcript button is always visible (no conditional hiding)
 
       // Reset video preview when changing notes
       const videoContent = document.getElementById('videoContent');
@@ -616,12 +785,477 @@ function renderMeetings() {
     return new Date(b.date) - new Date(a.date);
   });
 
-  // Filter out calendar entries and add only document type meetings to the container
-  allMeetings
-    .filter(meeting => meeting.type !== 'calendar') // Skip calendar entries
-    .forEach(meeting => {
-      notesContainer.appendChild(createMeetingCard(meeting));
+  // Filter out calendar entries
+  let filteredMeetings = allMeetings.filter(meeting => meeting.type !== 'calendar');
+
+  // Update all notes count in sidebar
+  const allNotesCount = document.getElementById('allNotesCount');
+  if (allNotesCount) {
+    allNotesCount.textContent = filteredMeetings.length;
+  }
+
+  // Apply tag filter if selected
+  if (window.selectedTagFilter) {
+    filteredMeetings = filteredMeetings.filter(meeting =>
+      meeting.tagIds && meeting.tagIds.includes(window.selectedTagFilter)
+    );
+  }
+
+  // Add filtered meetings to the container
+  filteredMeetings.forEach(meeting => {
+    notesContainer.appendChild(createMeetingCard(meeting));
+  });
+
+  // Update tag counts in sidebar
+  updateTagCounts();
+}
+
+// ============= Tag Management Functions =============
+
+// Load tags from backend
+async function loadTags() {
+  try {
+    const result = await window.electronAPI.getTags();
+    if (result.success) {
+      window.tags = result.data;
+      renderTagsSidebar();
+    }
+  } catch (error) {
+    console.error('Error loading tags:', error);
+  }
+}
+
+// Load tag colors from backend
+async function loadTagColors() {
+  try {
+    const result = await window.electronAPI.getTagColors();
+    if (result.success) {
+      window.tagColors = result.data;
+    }
+  } catch (error) {
+    console.error('Error loading tag colors:', error);
+  }
+}
+
+// Render tags in the sidebar
+function renderTagsSidebar() {
+  const tagsList = document.getElementById('tagsList');
+  if (!tagsList) return;
+
+  tagsList.innerHTML = '';
+
+  window.tags.forEach(tag => {
+    const tagItem = document.createElement('div');
+    tagItem.className = `tag-filter-item ${window.selectedTagFilter === tag.id ? 'selected' : ''}`;
+    tagItem.dataset.tagId = tag.id;
+
+    tagItem.innerHTML = `
+      <span class="tag-color-dot" style="background-color: ${tag.color}"></span>
+      <span class="tag-name">${tag.name}</span>
+      <span class="tag-count" data-tag-id="${tag.id}">0</span>
+      <button class="tag-edit-btn" data-tag-id="${tag.id}" title="Edit tag">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34a.9959.9959 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z" fill="currentColor"/>
+        </svg>
+      </button>
+    `;
+
+    tagsList.appendChild(tagItem);
+  });
+
+  // Update tag counts after rendering
+  updateTagCounts();
+
+  // Update selected state for "All Notes"
+  updateTagsSidebarSelection();
+}
+
+// Update tag counts in sidebar
+function updateTagCounts() {
+  const allMeetings = [...upcomingMeetings, ...pastMeetings].filter(m => m.type !== 'calendar');
+
+  window.tags.forEach(tag => {
+    const count = allMeetings.filter(m => m.tagIds && m.tagIds.includes(tag.id)).length;
+    const countEl = document.querySelector(`.tag-count[data-tag-id="${tag.id}"]`);
+    if (countEl) {
+      countEl.textContent = count;
+    }
+  });
+}
+
+// Update sidebar selection state
+function updateTagsSidebarSelection() {
+  const allItems = document.querySelectorAll('.tag-filter-item');
+  allItems.forEach(item => {
+    const tagId = item.dataset.tagId;
+    if (tagId === '' && !window.selectedTagFilter) {
+      item.classList.add('selected');
+    } else if (tagId === window.selectedTagFilter) {
+      item.classList.add('selected');
+    } else {
+      item.classList.remove('selected');
+    }
+  });
+}
+
+// Filter meetings by tag
+function filterMeetingsByTag(tagId) {
+  window.selectedTagFilter = tagId || null;
+  renderMeetings();
+  updateTagsSidebarSelection();
+}
+
+// Open tag editor modal
+function openTagEditorModal(tagId = null) {
+  const modal = document.getElementById('tagEditorModal');
+  const title = document.getElementById('tagEditorTitle');
+  const nameInput = document.getElementById('tagNameInput');
+  const editIdInput = document.getElementById('tagEditId');
+  const colorInput = document.getElementById('selectedTagColor');
+  const deleteBtn = document.getElementById('deleteTagBtn');
+  const colorPicker = document.getElementById('tagColorPicker');
+
+  // Reset form
+  nameInput.value = '';
+  editIdInput.value = '';
+  colorInput.value = window.tagColors[0]?.hex || '#6366F1';
+
+  // Render color picker
+  colorPicker.innerHTML = window.tagColors.map(c => `
+    <div class="color-option ${c.hex === colorInput.value ? 'selected' : ''}"
+         style="background-color: ${c.hex}"
+         data-color="${c.hex}"
+         title="${c.name}"></div>
+  `).join('');
+
+  if (tagId) {
+    // Edit mode
+    const tag = window.tags.find(t => t.id === tagId);
+    if (tag) {
+      title.textContent = 'Edit Tag';
+      nameInput.value = tag.name;
+      editIdInput.value = tag.id;
+      colorInput.value = tag.color;
+      deleteBtn.style.display = 'block';
+
+      // Update selected color
+      colorPicker.querySelectorAll('.color-option').forEach(opt => {
+        opt.classList.toggle('selected', opt.dataset.color === tag.color);
+      });
+    }
+  } else {
+    // Create mode
+    title.textContent = 'Create New Tag';
+    deleteBtn.style.display = 'none';
+  }
+
+  modal.style.display = 'flex';
+  nameInput.focus();
+}
+
+// Close tag editor modal
+function closeTagEditorModal() {
+  document.getElementById('tagEditorModal').style.display = 'none';
+}
+
+// Save tag (create or update)
+async function saveTag() {
+  const nameInput = document.getElementById('tagNameInput');
+  const editIdInput = document.getElementById('tagEditId');
+  const colorInput = document.getElementById('selectedTagColor');
+
+  const name = nameInput.value.trim();
+  const color = colorInput.value;
+  const tagId = editIdInput.value;
+
+  if (!name) {
+    nameInput.focus();
+    return;
+  }
+
+  try {
+    if (tagId) {
+      // Update existing tag
+      await window.electronAPI.updateTag(tagId, { name, color });
+    } else {
+      // Create new tag
+      await window.electronAPI.createTag({ name, color });
+    }
+
+    closeTagEditorModal();
+    await loadTags();
+    renderMeetings();
+  } catch (error) {
+    console.error('Error saving tag:', error);
+  }
+}
+
+// Delete tag
+async function deleteTag(tagId) {
+  if (!confirm('Are you sure you want to delete this tag? It will be removed from all meetings.')) {
+    return;
+  }
+
+  try {
+    await window.electronAPI.deleteTag(tagId);
+    closeTagEditorModal();
+
+    // If we're filtering by this tag, clear the filter
+    if (window.selectedTagFilter === tagId) {
+      window.selectedTagFilter = null;
+    }
+
+    await loadTags();
+    await loadMeetingsDataFromFile(); // Reload meetings to get updated tagIds
+    renderMeetings();
+  } catch (error) {
+    console.error('Error deleting tag:', error);
+  }
+}
+
+// Open tag picker dropdown for a meeting
+function openTagPicker(meetingId, buttonElement) {
+  const dropdown = document.getElementById('tagPickerDropdown');
+  const list = document.getElementById('tagPickerList');
+
+  // Get meeting's current tags
+  const meeting = [...upcomingMeetings, ...pastMeetings].find(m => m.id === meetingId);
+  const meetingTagIds = meeting?.tagIds || [];
+
+  // Render tag options with checkboxes
+  list.innerHTML = window.tags.map(tag => `
+    <div class="tag-picker-item" data-tag-id="${tag.id}" data-meeting-id="${meetingId}">
+      <input type="checkbox" ${meetingTagIds.includes(tag.id) ? 'checked' : ''}>
+      <span class="tag-color-dot" style="background-color: ${tag.color}"></span>
+      <span class="tag-name">${tag.name}</span>
+    </div>
+  `).join('');
+
+  if (window.tags.length === 0) {
+    list.innerHTML = '<div style="padding: 12px; color: #666; text-align: center;">No tags yet. Create one!</div>';
+  }
+
+  // Position dropdown near the button
+  const rect = buttonElement.getBoundingClientRect();
+  dropdown.style.top = `${rect.bottom + 4}px`;
+  dropdown.style.left = `${Math.max(10, rect.left - 100)}px`;
+  dropdown.dataset.meetingId = meetingId;
+  dropdown.style.display = 'block';
+}
+
+// Close tag picker dropdown
+function closeTagPicker() {
+  document.getElementById('tagPickerDropdown').style.display = 'none';
+}
+
+// Toggle tag on meeting
+async function toggleMeetingTag(meetingId, tagId, isChecked) {
+  try {
+    if (isChecked) {
+      await window.electronAPI.addTagToMeeting(meetingId, tagId);
+    } else {
+      await window.electronAPI.removeTagFromMeeting(meetingId, tagId);
+    }
+
+    // Update local state
+    const meeting = [...upcomingMeetings, ...pastMeetings].find(m => m.id === meetingId);
+    if (meeting) {
+      if (!meeting.tagIds) meeting.tagIds = [];
+      if (isChecked && !meeting.tagIds.includes(tagId)) {
+        meeting.tagIds.push(tagId);
+      } else if (!isChecked) {
+        meeting.tagIds = meeting.tagIds.filter(id => id !== tagId);
+      }
+    }
+
+    // Update counts
+    updateTagCounts();
+
+    // If we're in editor view for this meeting, update the editor tags
+    if (currentEditingMeetingId === meetingId && meeting) {
+      renderEditorTags(meeting);
+    }
+  } catch (error) {
+    console.error('Error toggling meeting tag:', error);
+  }
+}
+
+// Render tags in the note editor view
+function renderEditorTags(meeting) {
+  const container = document.getElementById('noteTagsList');
+  if (!container) return;
+
+  container.innerHTML = '';
+
+  if (meeting.tagIds && meeting.tagIds.length > 0) {
+    const meetingTags = window.tags.filter(t => meeting.tagIds.includes(t.id));
+    meetingTags.forEach(tag => {
+      const chip = document.createElement('span');
+      chip.className = 'note-tag-chip';
+      chip.style.backgroundColor = tag.color;
+      chip.dataset.tagId = tag.id;
+      chip.innerHTML = `
+        ${tag.name}
+        <button class="remove-tag" title="Remove tag">&times;</button>
+      `;
+      container.appendChild(chip);
     });
+  }
+}
+
+// Open tag picker for editor view
+function openEditorTagPicker(buttonElement) {
+  if (!currentEditingMeetingId) return;
+
+  const dropdown = document.getElementById('tagPickerDropdown');
+  const list = document.getElementById('tagPickerList');
+
+  // Get meeting's current tags
+  const meeting = [...upcomingMeetings, ...pastMeetings].find(m => m.id === currentEditingMeetingId);
+  const meetingTagIds = meeting?.tagIds || [];
+
+  // Render tag options with checkboxes
+  list.innerHTML = window.tags.map(tag => `
+    <div class="tag-picker-item" data-tag-id="${tag.id}" data-meeting-id="${currentEditingMeetingId}">
+      <input type="checkbox" ${meetingTagIds.includes(tag.id) ? 'checked' : ''}>
+      <span class="tag-color-dot" style="background-color: ${tag.color}"></span>
+      <span class="tag-name">${tag.name}</span>
+    </div>
+  `).join('');
+
+  if (window.tags.length === 0) {
+    list.innerHTML = '<div style="padding: 12px; color: #666; text-align: center;">No tags yet. Create one!</div>';
+  }
+
+  // Position dropdown near the button
+  const rect = buttonElement.getBoundingClientRect();
+  dropdown.style.top = `${rect.bottom + 4}px`;
+  dropdown.style.left = `${rect.left}px`;
+  dropdown.dataset.meetingId = currentEditingMeetingId;
+  dropdown.dataset.fromEditor = 'true';
+  dropdown.style.display = 'block';
+}
+
+// Remove tag from current meeting in editor
+async function removeTagFromEditor(tagId) {
+  if (!currentEditingMeetingId) return;
+
+  try {
+    await window.electronAPI.removeTagFromMeeting(currentEditingMeetingId, tagId);
+
+    // Update local state
+    const meeting = [...upcomingMeetings, ...pastMeetings].find(m => m.id === currentEditingMeetingId);
+    if (meeting && meeting.tagIds) {
+      meeting.tagIds = meeting.tagIds.filter(id => id !== tagId);
+    }
+
+    // Re-render editor tags
+    renderEditorTags(meeting);
+    updateTagCounts();
+  } catch (error) {
+    console.error('Error removing tag from editor:', error);
+  }
+}
+
+// Initialize tag event listeners
+function initTagEventListeners() {
+  // Add tag button
+  document.getElementById('addTagBtn')?.addEventListener('click', () => {
+    openTagEditorModal();
+  });
+
+  // Tag sidebar click (filter + edit)
+  document.getElementById('tagsSidebar')?.addEventListener('click', (e) => {
+    // Check for edit button click
+    const editBtn = e.target.closest('.tag-edit-btn');
+    if (editBtn) {
+      e.stopPropagation();
+      openTagEditorModal(editBtn.dataset.tagId);
+      return;
+    }
+
+    // Check for filter item click
+    const filterItem = e.target.closest('.tag-filter-item');
+    if (filterItem) {
+      const tagId = filterItem.dataset.tagId;
+      filterMeetingsByTag(tagId || null);
+    }
+  });
+
+  // Tag editor modal
+  document.getElementById('closeTagEditorModal')?.addEventListener('click', closeTagEditorModal);
+  document.getElementById('cancelTagEditor')?.addEventListener('click', closeTagEditorModal);
+
+  document.getElementById('tagEditorForm')?.addEventListener('submit', (e) => {
+    e.preventDefault();
+    saveTag();
+  });
+
+  document.getElementById('deleteTagBtn')?.addEventListener('click', () => {
+    const tagId = document.getElementById('tagEditId').value;
+    if (tagId) deleteTag(tagId);
+  });
+
+  // Color picker in modal
+  document.getElementById('tagColorPicker')?.addEventListener('click', (e) => {
+    const colorOption = e.target.closest('.color-option');
+    if (colorOption) {
+      document.querySelectorAll('#tagColorPicker .color-option').forEach(opt => opt.classList.remove('selected'));
+      colorOption.classList.add('selected');
+      document.getElementById('selectedTagColor').value = colorOption.dataset.color;
+    }
+  });
+
+  // Tag picker dropdown
+  document.getElementById('tagPickerList')?.addEventListener('click', (e) => {
+    const item = e.target.closest('.tag-picker-item');
+    if (item) {
+      const checkbox = item.querySelector('input[type="checkbox"]');
+      // Toggle if clicking the row (not directly on checkbox)
+      if (e.target !== checkbox) {
+        checkbox.checked = !checkbox.checked;
+      }
+      toggleMeetingTag(item.dataset.meetingId, item.dataset.tagId, checkbox.checked);
+    }
+  });
+
+  document.getElementById('createTagQuickBtn')?.addEventListener('click', () => {
+    closeTagPicker();
+    openTagEditorModal();
+  });
+
+  // Close tag picker when clicking outside
+  document.addEventListener('click', (e) => {
+    const dropdown = document.getElementById('tagPickerDropdown');
+    if (dropdown.style.display === 'block') {
+      if (!e.target.closest('#tagPickerDropdown') && !e.target.closest('.tag-meeting-btn') && !e.target.closest('.add-note-tag-btn')) {
+        closeTagPicker();
+      }
+    }
+  });
+
+  // Close modal when clicking overlay
+  document.getElementById('tagEditorModal')?.addEventListener('click', (e) => {
+    if (e.target.id === 'tagEditorModal') {
+      closeTagEditorModal();
+    }
+  });
+
+  // Editor view: Add tag button
+  document.getElementById('addNoteTagBtn')?.addEventListener('click', (e) => {
+    openEditorTagPicker(e.target);
+  });
+
+  // Editor view: Remove tag button
+  document.getElementById('noteTagsList')?.addEventListener('click', (e) => {
+    const removeBtn = e.target.closest('.remove-tag');
+    if (removeBtn) {
+      const chip = removeBtn.closest('.note-tag-chip');
+      if (chip) {
+        removeTagFromEditor(chip.dataset.tagId);
+      }
+    }
+  });
 }
 
 // Load meetings data from file
@@ -1222,6 +1856,96 @@ const sdkLogger = {
   }
 };
 
+// ========== Transcript Modal Functions ==========
+
+// Open the transcript modal and populate it with the current meeting's transcript
+function openTranscriptModal() {
+  const modal = document.getElementById('transcriptModal');
+  const modalContent = document.getElementById('transcriptModalContent');
+  const openRecordingBtn = document.getElementById('openRecordingBtn');
+
+  if (!modal || !modalContent) return;
+
+  // Get the current meeting's transcript
+  const meeting = [...upcomingMeetings, ...pastMeetings].find(m => m.id === currentEditingMeetingId);
+
+  // Show/hide Open Recording button based on whether video exists
+  if (openRecordingBtn) {
+    if (meeting && meeting.videoPath) {
+      openRecordingBtn.style.display = 'flex';
+    } else {
+      openRecordingBtn.style.display = 'none';
+    }
+  }
+
+  if (!meeting || !meeting.transcript || meeting.transcript.length === 0) {
+    modalContent.innerHTML = '<div class="modal-empty-state">No transcript available for this meeting.</div>';
+  } else {
+    // Build the transcript HTML
+    let html = '<div class="modal-transcript-entries">';
+    meeting.transcript.forEach(entry => {
+      const timestamp = entry.timestamp ? new Date(entry.timestamp).toLocaleTimeString() : '';
+      html += `
+        <div class="modal-transcript-entry">
+          <div class="modal-transcript-speaker">${entry.speaker || 'Unknown Speaker'}</div>
+          <div class="modal-transcript-text">${entry.text || ''}</div>
+          ${timestamp ? `<div class="modal-transcript-timestamp">${timestamp}</div>` : ''}
+        </div>
+      `;
+    });
+    html += '</div>';
+    modalContent.innerHTML = html;
+  }
+
+  // Show the modal
+  modal.style.display = 'flex';
+}
+
+// Close the transcript modal
+function closeTranscriptModal() {
+  const modal = document.getElementById('transcriptModal');
+  if (modal) {
+    modal.style.display = 'none';
+  }
+}
+
+// Copy the transcript to clipboard
+async function copyTranscript() {
+  const meeting = [...upcomingMeetings, ...pastMeetings].find(m => m.id === currentEditingMeetingId);
+
+  if (!meeting || !meeting.transcript || meeting.transcript.length === 0) {
+    return;
+  }
+
+  // Format transcript as "Speaker: text" per line
+  const formattedTranscript = meeting.transcript
+    .map(entry => `${entry.speaker || 'Unknown Speaker'}: ${entry.text || ''}`)
+    .join('\n\n');
+
+  try {
+    await navigator.clipboard.writeText(formattedTranscript);
+
+    // Show visual feedback
+    const copyBtn = document.getElementById('copyTranscriptBtn');
+    if (copyBtn) {
+      copyBtn.classList.add('copied');
+      const originalHTML = copyBtn.innerHTML;
+      copyBtn.innerHTML = `
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z" fill="currentColor"/>
+        </svg>
+      `;
+
+      setTimeout(() => {
+        copyBtn.classList.remove('copied');
+        copyBtn.innerHTML = originalHTML;
+      }, 2000);
+    }
+  } catch (error) {
+    console.error('Failed to copy transcript:', error);
+  }
+}
+
 // Initialize the app when the DOM is loaded
 document.addEventListener('DOMContentLoaded', async () => {
   console.log('DOM content loaded, loading data from file...');
@@ -1232,6 +1956,13 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Initialize the debug panel
   initDebugPanel();
 
+  // Initialize tag event listeners
+  initTagEventListeners();
+
+  // Load tag colors and tags
+  await loadTagColors();
+  await loadTags();
+
   // Try to load the latest data from file - this is the only data source
   await loadMeetingsDataFromFile();
 
@@ -1241,6 +1972,41 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // Initially show home view
   showHomeView();
+
+  // ============= Editor Mode Toggle (Edit/Preview) =============
+  const editorModeToggle = document.getElementById('editorModeToggle');
+  const simpleEditor = document.getElementById('simple-editor');
+  const markdownPreview = document.getElementById('markdown-preview');
+
+  if (editorModeToggle && simpleEditor && markdownPreview) {
+    editorModeToggle.addEventListener('click', () => {
+      window.isPreviewMode = !window.isPreviewMode;
+
+      const previewIcon = editorModeToggle.querySelector('.preview-icon');
+      const editIcon = editorModeToggle.querySelector('.edit-icon');
+      const toggleLabel = editorModeToggle.querySelector('.toggle-label');
+
+      if (window.isPreviewMode) {
+        // Switch to preview mode
+        const content = simpleEditor.value;
+        markdownPreview.innerHTML = marked.parse(content);
+        simpleEditor.style.display = 'none';
+        markdownPreview.style.display = 'block';
+        if (previewIcon) previewIcon.style.display = 'none';
+        if (editIcon) editIcon.style.display = 'block';
+        if (toggleLabel) toggleLabel.textContent = 'Edit';
+        editorModeToggle.classList.add('active');
+      } else {
+        // Switch to edit mode
+        simpleEditor.style.display = 'block';
+        markdownPreview.style.display = 'none';
+        if (previewIcon) previewIcon.style.display = 'block';
+        if (editIcon) editIcon.style.display = 'none';
+        if (toggleLabel) toggleLabel.textContent = 'Preview';
+        editorModeToggle.classList.remove('active');
+      }
+    });
+  }
 
   // Listen for meeting detection status updates
   window.electronAPI.onMeetingDetectionStatus((data) => {
@@ -1402,7 +2168,9 @@ document.addEventListener('DOMContentLoaded', async () => {
               // Add pulse effect to show there's new content
               debugPanelToggle.classList.add('has-new-content');
 
-              // Create a mini notification if we're recording
+              // Transcript notifications disabled - they block the coaching panel
+              // If you want to re-enable, uncomment the block below
+              /*
               if (window.isRecording) {
                 const miniNotification = document.createElement('div');
                 miniNotification.className = 'debug-notification transcript-notification';
@@ -1410,11 +2178,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                   <span class="debug-notification-speaker">${latestEntry.speaker || 'Unknown'}</span>:
                   <span class="debug-notification-text">${latestEntry.text.slice(0, 40)}${latestEntry.text.length > 40 ? '...' : ''}</span>
                 `;
-
-                // Add to document
                 document.body.appendChild(miniNotification);
-
-                // Remove after a short time
                 setTimeout(() => {
                   miniNotification.classList.add('fade-out');
                   setTimeout(() => {
@@ -1422,6 +2186,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                   }, 500);
                 }, 5000);
               }
+              */
             }
           }
         }
@@ -1475,15 +2240,22 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (currentEditingMeetingId === meetingId) {
       // Get the editor element
       const editorElement = document.getElementById('simple-editor');
+      const previewElement = document.getElementById('markdown-preview');
 
       // Update the editor with the latest streamed content
       // Use requestAnimationFrame for smoother updates that don't block the main thread
       requestAnimationFrame(() => {
         editorElement.value = content;
 
-        // Force the editor to scroll to the bottom to follow the new text
-        // This creates a better experience of watching text appear
-        editorElement.scrollTop = editorElement.scrollHeight;
+        // If in preview mode, also update the rendered markdown
+        if (window.isPreviewMode && previewElement) {
+          previewElement.innerHTML = marked.parse(content);
+          previewElement.scrollTop = previewElement.scrollHeight;
+        } else {
+          // Force the editor to scroll to the bottom to follow the new text
+          // This creates a better experience of watching text appear
+          editorElement.scrollTop = editorElement.scrollHeight;
+        }
       });
     }
   });
@@ -1583,6 +2355,15 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // Add click event delegation for meeting cards and their actions
   document.querySelector('.main-content').addEventListener('click', (e) => {
+    // Check if tag button was clicked
+    if (e.target.closest('.tag-meeting-btn')) {
+      e.stopPropagation(); // Prevent opening the note
+      const tagBtn = e.target.closest('.tag-meeting-btn');
+      const meetingId = tagBtn.dataset.id;
+      openTagPicker(meetingId, tagBtn);
+      return;
+    }
+
     // Check if delete button was clicked
     if (e.target.closest('.delete-meeting-btn')) {
       e.stopPropagation(); // Prevent opening the note
@@ -1684,46 +2465,171 @@ document.addEventListener('DOMContentLoaded', async () => {
   const toggleSidebarBtn = document.getElementById('toggleSidebar');
   const sidebar = document.getElementById('sidebar');
   const editorContent = document.querySelector('.editor-content');
-  const chatInputContainer = document.querySelector('.chat-input-container');
 
   // Start with sidebar hidden
   sidebar.classList.add('hidden');
   editorContent.classList.add('full-width');
-  chatInputContainer.style.display = 'none';
 
   toggleSidebarBtn.addEventListener('click', () => {
     sidebar.classList.toggle('hidden');
     editorContent.classList.toggle('full-width');
-
-    // Show/hide chat input with sidebar
-    if (sidebar.classList.contains('hidden')) {
-      chatInputContainer.style.display = 'none';
-    } else {
-      chatInputContainer.style.display = 'block';
-    }
   });
 
-  // Chat input handling
-  const chatInput = document.getElementById('chatInput');
-  const sendButton = document.getElementById('sendButton');
+  // AI Chat Modal handling
+  const aiChatModal = document.getElementById('aiChatModal');
+  const openAiChatBtn = document.getElementById('openAiChatBtn');
+  const closeAiChatModalBtn = document.getElementById('closeAiChatModal');
+  const aiChatInput = document.getElementById('aiChatInput');
+  const aiChatSendBtn = document.getElementById('aiChatSendBtn');
+  const aiChatMessages = document.getElementById('aiChatMessages');
 
-  // When send button is clicked
-  sendButton.addEventListener('click', () => {
-    const message = chatInput.value.trim();
-    if (message) {
-      console.log('Sending message:', message);
-      // Here you would handle the AI chat functionality
-      // For now, just clear the input
-      chatInput.value = '';
-    }
-  });
+  // Open AI Chat Modal
+  if (openAiChatBtn) {
+    openAiChatBtn.addEventListener('click', () => {
+      if (aiChatModal) {
+        aiChatModal.style.display = 'flex';
+        // Clear previous messages and show placeholder
+        aiChatMessages.innerHTML = `
+          <div class="ai-chat-placeholder">
+            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z" fill="#ddd"/>
+            </svg>
+            <p>Ask a question about the meeting transcript</p>
+          </div>
+        `;
+        aiChatInput.value = '';
+        aiChatInput.focus();
+      }
+    });
+  }
 
-  // Send message on Enter key
-  chatInput.addEventListener('keypress', (e) => {
-    if (e.key === 'Enter') {
-      sendButton.click();
+  // Close AI Chat Modal
+  if (closeAiChatModalBtn) {
+    closeAiChatModalBtn.addEventListener('click', () => {
+      if (aiChatModal) {
+        aiChatModal.style.display = 'none';
+      }
+    });
+  }
+
+  // Close modal when clicking overlay
+  if (aiChatModal) {
+    aiChatModal.addEventListener('click', (e) => {
+      if (e.target === aiChatModal) {
+        aiChatModal.style.display = 'none';
+      }
+    });
+  }
+
+  // Function to handle sending a question in the modal
+  async function handleAiChatQuestion() {
+    const question = aiChatInput.value.trim();
+    if (!question) return;
+    if (!currentEditingMeetingId) {
+      console.error('No meeting selected');
+      return;
     }
-  });
+
+    console.log('Asking question:', question);
+
+    // Clear input and disable send button
+    aiChatInput.value = '';
+    aiChatSendBtn.disabled = true;
+
+    // Clear placeholder if present
+    const placeholder = aiChatMessages.querySelector('.ai-chat-placeholder');
+    if (placeholder) {
+      placeholder.remove();
+    }
+
+    // Add user message
+    const userMessageDiv = document.createElement('div');
+    userMessageDiv.className = 'ai-chat-message user';
+    userMessageDiv.innerHTML = `
+      <div class="ai-chat-message-label">You</div>
+      <div class="ai-chat-message-content">${escapeHtml(question)}</div>
+    `;
+    aiChatMessages.appendChild(userMessageDiv);
+
+    // Add loading indicator
+    const loadingDiv = document.createElement('div');
+    loadingDiv.className = 'ai-chat-loading';
+    loadingDiv.innerHTML = `
+      <svg class="spinner" width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <circle cx="12" cy="12" r="10" stroke="#0077FF" stroke-width="2" fill="none" stroke-dasharray="31.4" stroke-dashoffset="10"/>
+      </svg>
+      <span>Thinking...</span>
+    `;
+    aiChatMessages.appendChild(loadingDiv);
+
+    // Scroll to bottom
+    aiChatMessages.scrollTop = aiChatMessages.scrollHeight;
+
+    try {
+      const result = await window.electronAPI.askMeetingQuestion(currentEditingMeetingId, question);
+
+      // Remove loading indicator
+      loadingDiv.remove();
+
+      // Add AI response
+      const aiMessageDiv = document.createElement('div');
+      aiMessageDiv.className = 'ai-chat-message assistant';
+
+      if (result.success) {
+        // Parse markdown in the response
+        const formattedAnswer = marked.parse(result.answer);
+        aiMessageDiv.innerHTML = `
+          <div class="ai-chat-message-label">AI</div>
+          <div class="ai-chat-message-content">${formattedAnswer}</div>
+        `;
+      } else {
+        aiMessageDiv.innerHTML = `
+          <div class="ai-chat-message-label">AI</div>
+          <div class="ai-chat-message-content" style="color: #dc3545;">Error: ${escapeHtml(result.error)}</div>
+        `;
+      }
+
+      aiChatMessages.appendChild(aiMessageDiv);
+
+      // Scroll to bottom
+      aiChatMessages.scrollTop = aiChatMessages.scrollHeight;
+    } catch (error) {
+      console.error('Error asking question:', error);
+      loadingDiv.remove();
+
+      const errorDiv = document.createElement('div');
+      errorDiv.className = 'ai-chat-message assistant';
+      errorDiv.innerHTML = `
+        <div class="ai-chat-message-label">AI</div>
+        <div class="ai-chat-message-content" style="color: #dc3545;">Error: ${escapeHtml(error.message || 'Failed to get response')}</div>
+      `;
+      aiChatMessages.appendChild(errorDiv);
+    } finally {
+      aiChatSendBtn.disabled = false;
+      aiChatInput.focus();
+    }
+  }
+
+  // Helper function to escape HTML
+  function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+  }
+
+  // Send button click
+  if (aiChatSendBtn) {
+    aiChatSendBtn.addEventListener('click', handleAiChatQuestion);
+  }
+
+  // Enter key to send
+  if (aiChatInput) {
+    aiChatInput.addEventListener('keypress', (e) => {
+      if (e.key === 'Enter') {
+        handleAiChatQuestion();
+      }
+    });
+  }
 
   // Handle share buttons
   const shareButtons = document.querySelectorAll('.share-btn');
@@ -1971,9 +2877,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         console.log('Starting streaming summary generation');
 
         // Log the Auto button summary generation to the SDK logger
-        sdkLogger.log('Auto button: Requesting AI summary generation for meeting: ' + currentEditingMeetingId);
+        sdkLogger.log('Auto button: Requesting AI summary generation for meeting: ' + currentEditingMeetingId + ', summaryTypeId: ' + (window.selectedSummaryTypeId || 'default'));
 
-        const result = await window.electronAPI.generateMeetingSummaryStreaming(currentEditingMeetingId);
+        const result = await window.electronAPI.generateMeetingSummaryStreaming(currentEditingMeetingId, window.selectedSummaryTypeId);
 
         if (result.success) {
           console.log('Summary generated successfully (streaming)');
@@ -2017,9 +2923,1118 @@ document.addEventListener('DOMContentLoaded', async () => {
         const meeting = [...upcomingMeetings, ...pastMeetings].find(m => m.id === meetingId);
         if (meeting) {
           document.getElementById('simple-editor').value = meeting.content;
+
+          // Show transcript sidebar section if transcript exists
+          const transcriptSidebarSection = document.getElementById('transcriptSidebarSection');
+          if (transcriptSidebarSection && meeting.transcript && meeting.transcript.length > 0) {
+            transcriptSidebarSection.style.display = 'block';
+          }
+
+          // Transcript button is always visible (no conditional display logic needed)
         }
       });
     }
   });
 
+  // ========== Transcript Modal Event Listeners ==========
+
+  // View Full Transcript button (sidebar)
+  const viewTranscriptBtn = document.getElementById('viewTranscriptBtn');
+  if (viewTranscriptBtn) {
+    viewTranscriptBtn.addEventListener('click', openTranscriptModal);
+  }
+
+  // View Full Transcript button (floating controls)
+  const viewTranscriptFloatingBtn = document.getElementById('viewTranscriptFloatingBtn');
+  if (viewTranscriptFloatingBtn) {
+    viewTranscriptFloatingBtn.addEventListener('click', openTranscriptModal);
+  }
+
+  // Close modal button
+  const closeTranscriptModalBtn = document.getElementById('closeTranscriptModal');
+  if (closeTranscriptModalBtn) {
+    closeTranscriptModalBtn.addEventListener('click', closeTranscriptModal);
+  }
+
+  // Copy transcript button
+  const copyTranscriptBtn = document.getElementById('copyTranscriptBtn');
+  if (copyTranscriptBtn) {
+    copyTranscriptBtn.addEventListener('click', copyTranscript);
+  }
+
+  // Open recording button
+  const openRecordingBtn = document.getElementById('openRecordingBtn');
+  if (openRecordingBtn) {
+    openRecordingBtn.addEventListener('click', async () => {
+      if (!currentEditingMeetingId) return;
+
+      try {
+        const result = await window.electronAPI.openVideoFile(currentEditingMeetingId);
+        if (!result.success) {
+          showToast(result.error || 'Failed to open recording', 'error');
+        }
+      } catch (error) {
+        console.error('Error opening recording:', error);
+        showToast('Failed to open recording', 'error');
+      }
+    });
+  }
+
+  // Close modal when clicking outside
+  const transcriptModal = document.getElementById('transcriptModal');
+  if (transcriptModal) {
+    transcriptModal.addEventListener('click', (e) => {
+      if (e.target === transcriptModal) {
+        closeTranscriptModal();
+      }
+    });
+  }
+
+  // ============= Settings Page Event Handlers =============
+
+  // Settings button click
+  const settingsBtn = document.getElementById('settingsBtn');
+  if (settingsBtn) {
+    settingsBtn.addEventListener('click', () => {
+      showSettingsView();
+    });
+  }
+
+  // Feedback interval slider
+  const feedbackIntervalSlider = document.getElementById('feedbackInterval');
+  const feedbackIntervalValue = document.getElementById('feedbackIntervalValue');
+  if (feedbackIntervalSlider && feedbackIntervalValue) {
+    feedbackIntervalSlider.addEventListener('input', () => {
+      feedbackIntervalValue.textContent = `${feedbackIntervalSlider.value}s`;
+    });
+  }
+
+  // Save global settings button
+  const saveGlobalSettingsBtn = document.getElementById('saveGlobalSettings');
+  if (saveGlobalSettingsBtn) {
+    saveGlobalSettingsBtn.addEventListener('click', saveGlobalSettings);
+  }
+
+  // Add bot button
+  const addBotBtn = document.getElementById('addBotBtn');
+  if (addBotBtn) {
+    addBotBtn.addEventListener('click', () => openBotEditor(null));
+  }
+
+  // Delete all recordings button
+  const deleteAllRecordingsBtn = document.getElementById('deleteAllRecordingsBtn');
+  if (deleteAllRecordingsBtn) {
+    deleteAllRecordingsBtn.addEventListener('click', async () => {
+      if (!confirm('Delete ALL recordings from Recall.ai? This action cannot be undone.')) {
+        return;
+      }
+
+      // Disable button and show loading state
+      deleteAllRecordingsBtn.disabled = true;
+      const originalText = deleteAllRecordingsBtn.textContent;
+      deleteAllRecordingsBtn.textContent = 'Deleting...';
+
+      try {
+        const result = await window.electronAPI.deleteAllRecordings();
+        if (result.success) {
+          showToast(`Successfully deleted ${result.deleted} recording(s)`);
+        } else {
+          showToast(result.error || 'Failed to delete recordings', 'error');
+        }
+      } catch (error) {
+        console.error('Error deleting recordings:', error);
+        showToast('Failed to delete recordings', 'error');
+      } finally {
+        // Re-enable button
+        deleteAllRecordingsBtn.disabled = false;
+        deleteAllRecordingsBtn.textContent = originalText;
+      }
+    });
+  }
+
+  // Clear local recordings button
+  const clearLocalRecordingsBtn = document.getElementById('clearLocalRecordingsBtn');
+  if (clearLocalRecordingsBtn) {
+    clearLocalRecordingsBtn.addEventListener('click', async () => {
+      if (!confirm('Delete ALL local recording files? This action cannot be undone.')) {
+        return;
+      }
+
+      // Disable button and show loading state
+      clearLocalRecordingsBtn.disabled = true;
+      const originalText = clearLocalRecordingsBtn.textContent;
+      clearLocalRecordingsBtn.textContent = 'Clearing...';
+
+      try {
+        const result = await window.electronAPI.clearLocalRecordings();
+        if (result.success) {
+          showToast(`Successfully deleted ${result.deleted} local recording(s)`);
+        } else {
+          showToast(result.error || 'Failed to clear local recordings', 'error');
+        }
+      } catch (error) {
+        console.error('Error clearing local recordings:', error);
+        showToast('Failed to clear local recordings', 'error');
+      } finally {
+        // Re-enable button
+        clearLocalRecordingsBtn.disabled = false;
+        clearLocalRecordingsBtn.textContent = originalText;
+      }
+    });
+  }
+
+  // Bot editor modal events
+  const closeBotEditorModalBtn = document.getElementById('closeBotEditorModal');
+  const cancelBotEditorBtn = document.getElementById('cancelBotEditor');
+  const botEditorForm = document.getElementById('botEditorForm');
+  const botEditorModal = document.getElementById('botEditorModal');
+
+  if (closeBotEditorModalBtn) {
+    closeBotEditorModalBtn.addEventListener('click', closeBotEditor);
+  }
+  if (cancelBotEditorBtn) {
+    cancelBotEditorBtn.addEventListener('click', closeBotEditor);
+  }
+  if (botEditorForm) {
+    botEditorForm.addEventListener('submit', handleBotEditorSubmit);
+  }
+  if (botEditorModal) {
+    botEditorModal.addEventListener('click', (e) => {
+      if (e.target === botEditorModal) {
+        closeBotEditor();
+      }
+    });
+  }
+
+  // ============= Bot Selector Event Handlers =============
+
+  const botSelectorBtn = document.getElementById('botSelectorBtn');
+  const botSelectorDropdown = document.getElementById('botSelectorDropdown');
+
+  if (botSelectorBtn && botSelectorDropdown) {
+    // Toggle dropdown on button click
+    botSelectorBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const isVisible = botSelectorDropdown.style.display === 'block';
+      botSelectorDropdown.style.display = isVisible ? 'none' : 'block';
+      if (!isVisible) {
+        loadBotSelectorOptions();
+      }
+    });
+
+    // Handle option clicks via event delegation
+    botSelectorDropdown.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const option = e.target.closest('.bot-selector-option');
+      if (option) {
+        const botId = option.dataset.botId;
+        selectCoachingBot(botId);
+        botSelectorDropdown.style.display = 'none';
+      }
+    });
+
+    // Close dropdown when clicking outside
+    document.addEventListener('click', (e) => {
+      if (!botSelectorBtn.contains(e.target) && !botSelectorDropdown.contains(e.target)) {
+        botSelectorDropdown.style.display = 'none';
+      }
+    });
+  }
+
+  // ============= Summary Editor Modal Event Handlers =============
+
+  const closeSummaryEditorModalBtn = document.getElementById('closeSummaryEditorModal');
+  const cancelSummaryEditorBtn = document.getElementById('cancelSummaryEditor');
+  const summaryEditorForm = document.getElementById('summaryEditorForm');
+  const summaryEditorModal = document.getElementById('summaryEditorModal');
+  const addSummaryTypeBtn = document.getElementById('addSummaryTypeBtn');
+
+  if (closeSummaryEditorModalBtn) {
+    closeSummaryEditorModalBtn.addEventListener('click', closeSummaryEditor);
+  }
+  if (cancelSummaryEditorBtn) {
+    cancelSummaryEditorBtn.addEventListener('click', closeSummaryEditor);
+  }
+  if (summaryEditorForm) {
+    summaryEditorForm.addEventListener('submit', handleSummaryEditorSubmit);
+  }
+  if (summaryEditorModal) {
+    summaryEditorModal.addEventListener('click', (e) => {
+      if (e.target === summaryEditorModal) {
+        closeSummaryEditor();
+      }
+    });
+  }
+  if (addSummaryTypeBtn) {
+    addSummaryTypeBtn.addEventListener('click', () => openSummaryEditor(null));
+  }
+
+  // Default summary type dropdown change handler
+  const defaultSummaryTypeSelect = document.getElementById('defaultSummaryType');
+  if (defaultSummaryTypeSelect) {
+    defaultSummaryTypeSelect.addEventListener('change', async () => {
+      try {
+        await window.electronAPI.updateSummaryGlobalSettings({
+          defaultSummaryTypeId: defaultSummaryTypeSelect.value || null
+        });
+        showToast('Default summary type updated');
+      } catch (error) {
+        console.error('Error updating default summary type:', error);
+        showToast('Failed to update default', 'error');
+      }
+    });
+  }
+
+  // ============= Summary Selector Event Handlers =============
+
+  const summarySelectorBtn = document.getElementById('summarySelectorBtn');
+  const summarySelectorDropdown = document.getElementById('summarySelectorDropdown');
+
+  if (summarySelectorBtn && summarySelectorDropdown) {
+    // Toggle dropdown on button click
+    summarySelectorBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const isVisible = summarySelectorDropdown.style.display === 'block';
+      // Close bot selector dropdown if open
+      const botDropdown = document.getElementById('botSelectorDropdown');
+      if (botDropdown) botDropdown.style.display = 'none';
+
+      summarySelectorDropdown.style.display = isVisible ? 'none' : 'block';
+      if (!isVisible) {
+        loadSummarySelectorOptions();
+      }
+    });
+
+    // Close dropdown when clicking outside
+    document.addEventListener('click', (e) => {
+      if (!summarySelectorBtn.contains(e.target) && !summarySelectorDropdown.contains(e.target)) {
+        summarySelectorDropdown.style.display = 'none';
+      }
+    });
+  }
+
+  // ============= Regenerate Summary Confirmation Modal Event Handlers =============
+
+  const closeRegenerateSummaryModalBtn = document.getElementById('closeRegenerateSummaryModal');
+  const cancelRegenerateSummaryBtn = document.getElementById('cancelRegenerateSummary');
+  const confirmRegenerateSummaryBtn = document.getElementById('confirmRegenerateSummary');
+  const regenerateSummaryModal = document.getElementById('regenerateSummaryModal');
+
+  if (closeRegenerateSummaryModalBtn) {
+    closeRegenerateSummaryModalBtn.addEventListener('click', () => {
+      regenerateSummaryModal.style.display = 'none';
+    });
+  }
+  if (cancelRegenerateSummaryBtn) {
+    cancelRegenerateSummaryBtn.addEventListener('click', () => {
+      regenerateSummaryModal.style.display = 'none';
+    });
+  }
+  if (confirmRegenerateSummaryBtn) {
+    confirmRegenerateSummaryBtn.addEventListener('click', confirmRegenerateSummary);
+  }
+  if (regenerateSummaryModal) {
+    regenerateSummaryModal.addEventListener('click', (e) => {
+      if (e.target === regenerateSummaryModal) {
+        regenerateSummaryModal.style.display = 'none';
+      }
+    });
+  }
+
+  // ============= Coaching Panel Event Handlers =============
+
+  const minimizeCoachingPanelBtn = document.getElementById('minimizeCoachingPanel');
+  const closeCoachingPanelBtn = document.getElementById('closeCoachingPanel');
+  const coachingPanel = document.getElementById('coachingPanel');
+
+  if (minimizeCoachingPanelBtn && coachingPanel) {
+    minimizeCoachingPanelBtn.addEventListener('click', () => {
+      coachingPanel.classList.toggle('minimized');
+    });
+  }
+
+  if (closeCoachingPanelBtn) {
+    closeCoachingPanelBtn.addEventListener('click', () => {
+      deactivateCoachingBot();
+    });
+  }
+
+  // ============= Coaching Events from Main Process =============
+
+  window.electronAPI.onCoachingFeedbackChunk((data) => {
+    handleCoachingFeedbackChunk(data);
+  });
+
+  window.electronAPI.onCoachingStatusChange((data) => {
+    handleCoachingStatusChange(data);
+  });
+
+  window.electronAPI.onCoachingError((data) => {
+    handleCoachingError(data);
+  });
+
+  // Load available models on startup
+  loadAvailableModels();
+
 });
+
+// ============= Settings Page Functions =============
+
+async function loadSettingsData() {
+  try {
+    // Load global settings
+    const settingsResult = await window.electronAPI.getGlobalSettings();
+    if (settingsResult.success) {
+      const settings = settingsResult.data;
+      const feedbackIntervalSlider = document.getElementById('feedbackInterval');
+      const feedbackIntervalValue = document.getElementById('feedbackIntervalValue');
+      const defaultModelSelect = document.getElementById('defaultModel');
+
+      if (feedbackIntervalSlider) {
+        feedbackIntervalSlider.value = settings.feedbackIntervalSeconds;
+      }
+      if (feedbackIntervalValue) {
+        feedbackIntervalValue.textContent = `${settings.feedbackIntervalSeconds}s`;
+      }
+      if (defaultModelSelect) {
+        defaultModelSelect.value = settings.defaultModel;
+      }
+    }
+
+    // Load bot types
+    await loadBotTypes();
+
+    // Load summary types
+    await loadSummaryTypes();
+  } catch (error) {
+    console.error('Error loading settings:', error);
+  }
+}
+
+async function loadAvailableModels() {
+  try {
+    const result = await window.electronAPI.getAvailableModels();
+    if (result.success) {
+      window.availableModels = result.data;
+      populateModelSelects();
+    }
+  } catch (error) {
+    console.error('Error loading available models:', error);
+  }
+}
+
+function populateModelSelects() {
+  const selects = ['defaultModel', 'botModel'];
+  selects.forEach(selectId => {
+    const select = document.getElementById(selectId);
+    if (select) {
+      select.innerHTML = '';
+      window.availableModels.forEach(model => {
+        const option = document.createElement('option');
+        option.value = model.id;
+        option.textContent = model.name;
+        select.appendChild(option);
+      });
+    }
+  });
+}
+
+async function saveGlobalSettings() {
+  const feedbackIntervalSlider = document.getElementById('feedbackInterval');
+  const defaultModelSelect = document.getElementById('defaultModel');
+
+  const updates = {
+    feedbackIntervalSeconds: parseInt(feedbackIntervalSlider.value, 10),
+    defaultModel: defaultModelSelect.value
+  };
+
+  try {
+    const result = await window.electronAPI.updateGlobalSettings(updates);
+    if (result.success) {
+      showToast('Settings saved successfully');
+    } else {
+      showToast('Failed to save settings', 'error');
+    }
+  } catch (error) {
+    console.error('Error saving settings:', error);
+    showToast('Failed to save settings', 'error');
+  }
+}
+
+async function loadBotTypes() {
+  try {
+    const result = await window.electronAPI.getBotTypes();
+    if (result.success) {
+      window.botTypes = result.data;
+      renderBotTypesList();
+    }
+  } catch (error) {
+    console.error('Error loading bot types:', error);
+  }
+}
+
+function renderBotTypesList() {
+  const container = document.getElementById('botTypesList');
+  if (!container) return;
+
+  if (window.botTypes.length === 0) {
+    container.innerHTML = `
+      <div class="bot-types-empty">
+        <p>No coaching bots yet. Click "+ Add Bot" to create one.</p>
+      </div>
+    `;
+    return;
+  }
+
+  container.innerHTML = window.botTypes.map(bot => `
+    <div class="bot-type-card" data-bot-id="${bot.id}">
+      <div class="bot-type-info">
+        <h4 class="bot-type-name">${bot.name}</h4>
+        <p class="bot-type-model">${getModelName(bot.model)}</p>
+      </div>
+      <div class="bot-type-actions">
+        <button class="bot-action-btn edit" onclick="openBotEditor('${bot.id}')">Edit</button>
+        <button class="bot-action-btn delete" onclick="deleteBotType('${bot.id}')">Delete</button>
+      </div>
+    </div>
+  `).join('');
+}
+
+function getModelName(modelId) {
+  const model = window.availableModels.find(m => m.id === modelId);
+  return model ? model.name : modelId;
+}
+
+function openBotEditor(botId) {
+  const modal = document.getElementById('botEditorModal');
+  const title = document.getElementById('botEditorTitle');
+  const nameInput = document.getElementById('botName');
+  const modelSelect = document.getElementById('botModel');
+  const promptTextarea = document.getElementById('botSystemPrompt');
+  const editIdInput = document.getElementById('botEditId');
+
+  if (botId) {
+    // Editing existing bot
+    const bot = window.botTypes.find(b => b.id === botId);
+    if (bot) {
+      title.textContent = 'Edit Bot';
+      nameInput.value = bot.name;
+      modelSelect.value = bot.model;
+      promptTextarea.value = bot.systemPrompt;
+      editIdInput.value = botId;
+    }
+  } else {
+    // Creating new bot
+    title.textContent = 'Create New Bot';
+    nameInput.value = '';
+    promptTextarea.value = '';
+    editIdInput.value = '';
+    // Set default model
+    if (window.availableModels.length > 0) {
+      modelSelect.value = window.availableModels[0].id;
+    }
+  }
+
+  modal.style.display = 'flex';
+}
+
+function closeBotEditor() {
+  const modal = document.getElementById('botEditorModal');
+  modal.style.display = 'none';
+}
+
+async function handleBotEditorSubmit(e) {
+  e.preventDefault();
+
+  const nameInput = document.getElementById('botName');
+  const modelSelect = document.getElementById('botModel');
+  const promptTextarea = document.getElementById('botSystemPrompt');
+  const editIdInput = document.getElementById('botEditId');
+
+  const botData = {
+    name: nameInput.value,
+    model: modelSelect.value,
+    systemPrompt: promptTextarea.value
+  };
+
+  try {
+    let result;
+    if (editIdInput.value) {
+      // Update existing bot
+      result = await window.electronAPI.updateBotType(editIdInput.value, botData);
+    } else {
+      // Create new bot
+      result = await window.electronAPI.createBotType(botData);
+    }
+
+    if (result.success) {
+      closeBotEditor();
+      await loadBotTypes();
+      showToast(editIdInput.value ? 'Bot updated successfully' : 'Bot created successfully');
+    } else {
+      showToast('Failed to save bot', 'error');
+    }
+  } catch (error) {
+    console.error('Error saving bot:', error);
+    showToast('Failed to save bot', 'error');
+  }
+}
+
+async function deleteBotType(botId) {
+  if (!confirm('Are you sure you want to delete this bot?')) return;
+
+  try {
+    const result = await window.electronAPI.deleteBotType(botId);
+    if (result.success) {
+      await loadBotTypes();
+      showToast('Bot deleted successfully');
+    } else {
+      showToast('Failed to delete bot', 'error');
+    }
+  } catch (error) {
+    console.error('Error deleting bot:', error);
+    showToast('Failed to delete bot', 'error');
+  }
+}
+
+// Make functions available globally for onclick handlers
+window.openBotEditor = openBotEditor;
+window.deleteBotType = deleteBotType;
+
+// ============= Bot Selector Functions =============
+
+async function loadBotSelectorOptions() {
+  const dropdown = document.getElementById('botSelectorDropdown');
+  if (!dropdown) return;
+
+  // Get fresh bot types
+  const result = await window.electronAPI.getBotTypes();
+  if (result.success) {
+    window.botTypes = result.data;
+  }
+
+  // Build dropdown options
+  let html = `
+    <div class="bot-selector-option ${!window.activeCoachingBot ? 'selected' : ''}" data-bot-id="">
+      <span>No Coach</span>
+      ${!window.activeCoachingBot ? '<span class="check-icon">&#10003;</span>' : ''}
+    </div>
+  `;
+
+  window.botTypes.forEach(bot => {
+    const isSelected = window.activeCoachingBot?.id === bot.id;
+    html += `
+      <div class="bot-selector-option ${isSelected ? 'selected' : ''}" data-bot-id="${bot.id}">
+        <span>${bot.name}</span>
+        ${isSelected ? '<span class="check-icon">&#10003;</span>' : ''}
+      </div>
+    `;
+  });
+
+  dropdown.innerHTML = html;
+  // Click handling is done via event delegation in DOMContentLoaded
+}
+
+async function selectCoachingBot(botId) {
+  const selectorBtn = document.getElementById('botSelectorBtn');
+  const selectorLabel = document.getElementById('botSelectorLabel');
+
+  if (!botId) {
+    // Deactivate coaching
+    await deactivateCoachingBot();
+    if (selectorLabel) selectorLabel.textContent = 'No Coach';
+    if (selectorBtn) selectorBtn.classList.remove('active');
+  } else {
+    // Activate coaching with selected bot
+    const bot = window.botTypes.find(b => b.id === botId);
+    if (bot) {
+      await activateCoachingBot(bot);
+      if (selectorLabel) selectorLabel.textContent = bot.name;
+      if (selectorBtn) selectorBtn.classList.add('active');
+    }
+  }
+}
+
+async function activateCoachingBot(bot) {
+  if (!currentEditingMeetingId) {
+    showToast('Please open a meeting note first', 'error');
+    return;
+  }
+
+  window.activeCoachingBot = bot;
+
+  // Show coaching panel
+  const coachingPanel = document.getElementById('coachingPanel');
+  const coachingBotName = document.getElementById('coachingBotName');
+  const coachingContent = document.getElementById('coachingContent');
+
+  if (coachingPanel) {
+    coachingPanel.style.display = 'flex';
+    coachingPanel.classList.remove('minimized');
+  }
+  if (coachingBotName) {
+    coachingBotName.textContent = bot.name;
+  }
+  if (coachingContent) {
+    coachingContent.innerHTML = `
+      <div class="coaching-placeholder">
+        <p>Listening to your conversation...</p>
+      </div>
+    `;
+  }
+
+  updateCoachingStatus('Waiting for transcript...');
+
+  // Notify main process to activate coaching
+  try {
+    await window.electronAPI.activateCoachingBot({
+      botType: bot,
+      meetingId: currentEditingMeetingId
+    });
+  } catch (error) {
+    console.error('Error activating coaching bot:', error);
+    showToast('Failed to activate coaching', 'error');
+  }
+}
+
+async function deactivateCoachingBot() {
+  window.activeCoachingBot = null;
+
+  // Hide coaching panel
+  const coachingPanel = document.getElementById('coachingPanel');
+  if (coachingPanel) {
+    coachingPanel.style.display = 'none';
+  }
+
+  // Reset selector
+  const selectorBtn = document.getElementById('botSelectorBtn');
+  const selectorLabel = document.getElementById('botSelectorLabel');
+  if (selectorLabel) selectorLabel.textContent = 'No Coach';
+  if (selectorBtn) selectorBtn.classList.remove('active');
+
+  // Notify main process to deactivate coaching
+  try {
+    await window.electronAPI.deactivateCoachingBot();
+  } catch (error) {
+    console.error('Error deactivating coaching bot:', error);
+  }
+}
+
+// ============= Coaching Panel Functions =============
+
+function handleCoachingFeedbackChunk(data) {
+  const coachingContent = document.getElementById('coachingContent');
+  if (!coachingContent) return;
+
+  // Remove placeholder if present
+  const placeholder = coachingContent.querySelector('.coaching-placeholder');
+  if (placeholder) {
+    placeholder.remove();
+  }
+
+  // Find or create current feedback entry
+  let currentEntry = coachingContent.querySelector('.coaching-feedback-entry.streaming');
+  if (!currentEntry) {
+    currentEntry = document.createElement('div');
+    currentEntry.className = 'coaching-feedback-entry streaming';
+    currentEntry.innerHTML = `
+      <div class="coaching-feedback-text"></div>
+      <div class="coaching-feedback-time">${new Date().toLocaleTimeString()}</div>
+    `;
+    coachingContent.insertBefore(currentEntry, coachingContent.firstChild);
+  }
+
+  // Update the text content
+  const textEl = currentEntry.querySelector('.coaching-feedback-text');
+  if (textEl) {
+    if (data.done) {
+      // Streaming complete, finalize entry with markdown
+      textEl.innerHTML = parseSimpleMarkdown(data.text);
+      currentEntry.classList.remove('streaming');
+      updateCoachingStatus('Listening...');
+    } else {
+      // While streaming, show plain text (faster)
+      textEl.textContent = data.text;
+    }
+  }
+
+  // Auto-scroll to show latest content
+  coachingContent.scrollTop = 0;
+}
+
+// Simple markdown parser for coaching feedback
+function parseSimpleMarkdown(text) {
+  if (!text) return '';
+
+  return text
+    // Escape HTML first
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    // Bold: **text** or __text__
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/__(.+?)__/g, '<strong>$1</strong>')
+    // Italic: *text* or _text_
+    .replace(/\*(.+?)\*/g, '<em>$1</em>')
+    .replace(/_(.+?)_/g, '<em>$1</em>')
+    // Line breaks
+    .replace(/\n/g, '<br>');
+}
+
+function handleCoachingStatusChange(data) {
+  if (data.status === 'thinking') {
+    updateCoachingStatus('Generating feedback...', true);
+  } else if (data.status === 'listening') {
+    updateCoachingStatus('Listening...');
+  } else if (data.status === 'inactive') {
+    // Coaching was deactivated
+    deactivateCoachingBot();
+  }
+}
+
+function handleCoachingError(data) {
+  console.error('Coaching error:', data.error);
+  updateCoachingStatus(`Error: ${data.error}`);
+
+  const coachingContent = document.getElementById('coachingContent');
+  if (coachingContent) {
+    const errorEntry = document.createElement('div');
+    errorEntry.className = 'coaching-feedback-entry error';
+    errorEntry.innerHTML = `
+      <div class="coaching-feedback-text" style="color: #c00;">Error: ${data.error}</div>
+      <div class="coaching-feedback-time">${new Date().toLocaleTimeString()}</div>
+    `;
+    coachingContent.insertBefore(errorEntry, coachingContent.firstChild);
+  }
+}
+
+function updateCoachingStatus(text, isThinking = false) {
+  const statusContainer = document.getElementById('coachingStatus');
+  const statusText = statusContainer?.querySelector('.status-text');
+
+  if (statusContainer) {
+    if (isThinking) {
+      statusContainer.classList.add('thinking');
+    } else {
+      statusContainer.classList.remove('thinking');
+    }
+  }
+
+  if (statusText) {
+    statusText.textContent = text;
+  }
+}
+
+// ============= Summary Type Management Functions =============
+
+async function loadSummaryTypes() {
+  try {
+    const result = await window.electronAPI.getSummaryTypes();
+    if (result.success) {
+      window.summaryTypes = result.data;
+      renderSummaryTypesList();
+      await updateDefaultSummaryTypeDropdown();
+    }
+  } catch (error) {
+    console.error('Error loading summary types:', error);
+  }
+}
+
+function renderSummaryTypesList() {
+  const container = document.getElementById('summaryTypesList');
+  if (!container) return;
+
+  if (window.summaryTypes.length === 0) {
+    container.innerHTML = `
+      <div class="bot-types-empty">
+        <p>No summary types yet. Click "+ Add Summary Type" to create one.</p>
+      </div>
+    `;
+    return;
+  }
+
+  container.innerHTML = window.summaryTypes.map(type => `
+    <div class="bot-type-card" data-summary-id="${type.id}">
+      <div class="bot-type-info">
+        <h4 class="bot-type-name">${type.name}</h4>
+        <p class="bot-type-model">${type.systemPrompt.substring(0, 60)}...</p>
+      </div>
+      <div class="bot-type-actions">
+        <button class="bot-action-btn edit" onclick="openSummaryEditor('${type.id}')">Edit</button>
+        <button class="bot-action-btn delete" onclick="deleteSummaryType('${type.id}')">Delete</button>
+      </div>
+    </div>
+  `).join('');
+}
+
+async function updateDefaultSummaryTypeDropdown() {
+  const select = document.getElementById('defaultSummaryType');
+  if (!select) return;
+
+  // Get current default
+  const settingsResult = await window.electronAPI.getSummaryGlobalSettings();
+  const currentDefault = settingsResult.success ? settingsResult.data.defaultSummaryTypeId : null;
+
+  // Build options
+  let html = '<option value="">-- No Default (use built-in) --</option>';
+  window.summaryTypes.forEach(type => {
+    const selected = type.id === currentDefault ? 'selected' : '';
+    html += `<option value="${type.id}" ${selected}>${type.name}</option>`;
+  });
+  select.innerHTML = html;
+}
+
+function openSummaryEditor(typeId) {
+  const modal = document.getElementById('summaryEditorModal');
+  const title = document.getElementById('summaryEditorTitle');
+  const nameInput = document.getElementById('summaryTypeName');
+  const promptTextarea = document.getElementById('summaryTypePrompt');
+  const editIdInput = document.getElementById('summaryEditId');
+
+  if (typeId) {
+    // Editing existing type
+    const type = window.summaryTypes.find(t => t.id === typeId);
+    if (type) {
+      title.textContent = 'Edit Summary Type';
+      nameInput.value = type.name;
+      promptTextarea.value = type.systemPrompt;
+      editIdInput.value = typeId;
+    }
+  } else {
+    // Creating new type
+    title.textContent = 'Create New Summary Type';
+    nameInput.value = '';
+    promptTextarea.value = '';
+    editIdInput.value = '';
+  }
+
+  modal.style.display = 'flex';
+}
+
+function closeSummaryEditor() {
+  const modal = document.getElementById('summaryEditorModal');
+  modal.style.display = 'none';
+}
+
+async function handleSummaryEditorSubmit(e) {
+  e.preventDefault();
+
+  const nameInput = document.getElementById('summaryTypeName');
+  const promptTextarea = document.getElementById('summaryTypePrompt');
+  const editIdInput = document.getElementById('summaryEditId');
+
+  const typeData = {
+    name: nameInput.value,
+    systemPrompt: promptTextarea.value
+  };
+
+  try {
+    let result;
+    if (editIdInput.value) {
+      // Update existing type
+      result = await window.electronAPI.updateSummaryType(editIdInput.value, typeData);
+    } else {
+      // Create new type
+      result = await window.electronAPI.createSummaryType(typeData);
+    }
+
+    if (result.success) {
+      closeSummaryEditor();
+      await loadSummaryTypes();
+      showToast(editIdInput.value ? 'Summary type updated successfully' : 'Summary type created successfully');
+    } else {
+      showToast('Failed to save summary type', 'error');
+    }
+  } catch (error) {
+    console.error('Error saving summary type:', error);
+    showToast('Failed to save summary type', 'error');
+  }
+}
+
+async function deleteSummaryType(typeId) {
+  if (!confirm('Are you sure you want to delete this summary type?')) return;
+
+  try {
+    const result = await window.electronAPI.deleteSummaryType(typeId);
+    if (result.success) {
+      await loadSummaryTypes();
+      showToast('Summary type deleted successfully');
+    } else {
+      showToast('Failed to delete summary type', 'error');
+    }
+  } catch (error) {
+    console.error('Error deleting summary type:', error);
+    showToast('Failed to delete summary type', 'error');
+  }
+}
+
+// Make summary functions available globally for onclick handlers
+window.openSummaryEditor = openSummaryEditor;
+window.deleteSummaryType = deleteSummaryType;
+
+// ============= Summary Selector Functions =============
+
+async function loadSummarySelectorOptions() {
+  const dropdown = document.getElementById('summarySelectorDropdown');
+  if (!dropdown) return;
+
+  // Get fresh summary types
+  const result = await window.electronAPI.getSummaryTypes();
+  if (result.success) {
+    window.summaryTypes = result.data;
+  }
+
+  // Get default summary type info
+  const settingsResult = await window.electronAPI.getSummaryGlobalSettings();
+  const defaultId = settingsResult.success ? settingsResult.data.defaultSummaryTypeId : null;
+  const defaultType = defaultId ? window.summaryTypes.find(t => t.id === defaultId) : null;
+  const defaultLabel = defaultType ? `Default (${defaultType.name})` : 'Default (Built-in)';
+
+  // Build dropdown options
+  let html = `
+    <div class="summary-selector-option ${!window.selectedSummaryTypeId ? 'selected' : ''}" data-summary-id="">
+      <span>${defaultLabel}</span>
+      ${!window.selectedSummaryTypeId ? '<span class="check-icon">&#10003;</span>' : ''}
+    </div>
+  `;
+
+  window.summaryTypes.forEach(type => {
+    const isSelected = window.selectedSummaryTypeId === type.id;
+    html += `
+      <div class="summary-selector-option ${isSelected ? 'selected' : ''}" data-summary-id="${type.id}">
+        <span>${type.name}</span>
+        ${isSelected ? '<span class="check-icon">&#10003;</span>' : ''}
+      </div>
+    `;
+  });
+
+  dropdown.innerHTML = html;
+
+  // Add click handlers to options
+  dropdown.querySelectorAll('.summary-selector-option').forEach(option => {
+    option.addEventListener('click', () => {
+      const typeId = option.dataset.summaryId;
+      selectSummaryType(typeId);
+      dropdown.style.display = 'none';
+    });
+  });
+}
+
+async function selectSummaryType(typeId) {
+  // Get the current meeting
+  const meeting = [...upcomingMeetings, ...pastMeetings].find(m => m.id === currentEditingMeetingId);
+
+  // If meeting already has a summary and we're changing the type, show confirmation
+  if (meeting && meeting.hasSummary && typeId !== window.selectedSummaryTypeId) {
+    showRegenerateSummaryConfirmation(typeId);
+    return;
+  }
+
+  // Update selection
+  window.selectedSummaryTypeId = typeId || null;
+  updateSummarySelectorLabel();
+}
+
+function showRegenerateSummaryConfirmation(typeId) {
+  const modal = document.getElementById('regenerateSummaryModal');
+  const typeName = typeId ?
+    window.summaryTypes.find(t => t.id === typeId)?.name || 'Selected Type' :
+    'Default';
+
+  document.getElementById('regenerateSummaryTypeName').textContent = typeName;
+  modal.style.display = 'flex';
+
+  // Store pending selection
+  modal.dataset.pendingTypeId = typeId || '';
+}
+
+async function confirmRegenerateSummary() {
+  const modal = document.getElementById('regenerateSummaryModal');
+  const typeId = modal.dataset.pendingTypeId;
+
+  modal.style.display = 'none';
+
+  // Update selection
+  window.selectedSummaryTypeId = typeId || null;
+  updateSummarySelectorLabel();
+
+  // Trigger regeneration with new type
+  await regenerateSummaryWithType(typeId);
+}
+
+async function regenerateSummaryWithType(typeId) {
+  const generateButton = document.querySelector('.generate-btn');
+  if (!currentEditingMeetingId) {
+    showToast('No meeting selected', 'error');
+    return;
+  }
+
+  // Show loading state
+  if (generateButton) {
+    generateButton.disabled = true;
+    generateButton.innerHTML = `
+      <svg class="spinner" width="16" height="16" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="2" fill="none" stroke-dasharray="31.4" stroke-dashoffset="10">
+          <animateTransform attributeName="transform" type="rotate" from="0 12 12" to="360 12 12" dur="1s" repeatCount="indefinite"/>
+        </circle>
+      </svg>
+      Generating...
+    `;
+  }
+
+  try {
+    const result = await window.electronAPI.generateMeetingSummaryStreaming(currentEditingMeetingId, typeId || null);
+    if (result.success) {
+      showToast('Summary regenerated successfully');
+    } else {
+      showToast('Failed to regenerate summary', 'error');
+    }
+  } catch (error) {
+    console.error('Error regenerating summary:', error);
+    showToast('Failed to regenerate summary', 'error');
+  } finally {
+    // Restore button
+    if (generateButton) {
+      generateButton.disabled = false;
+      generateButton.innerHTML = `
+        <svg width="16" height="16" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg" style="margin-right: 4px;">
+          <path d="M208,512a24.84,24.84,0,0,1-23.34-16l-39.84-103.6a16.06,16.06,0,0,0-9.19-9.19L32,343.34a25,25,0,0,1,0-46.68l103.6-39.84a16.06,16.06,0,0,0,9.19-9.19L184.66,144a25,25,0,0,1,46.68,0l39.84,103.6a16.06,16.06,0,0,0,9.19,9.19l103,39.63A25.49,25.49,0,0,1,400,320.52a24.82,24.82,0,0,1-16,22.82l-103.6,39.84a16.06,16.06,0,0,0-9.19,9.19L231.34,496A24.84,24.84,0,0,1,208,512Z" fill="currentColor"/>
+          <path d="M88,176a14.67,14.67,0,0,1-13.69-9.4L57.45,122.76a7.28,7.28,0,0,0-4.21-4.21L9.4,101.69a14.67,14.67,0,0,1,0-27.38L53.24,57.45a7.31,7.31,0,0,0,4.21-4.21L74.16,9.79A15,15,0,0,1,86.23.11,14.67,14.67,0,0,1,101.69,9.4l16.86,43.84a7.31,7.31,0,0,0,4.21,4.21L166.6,74.31a14.67,14.67,0,0,1,0,27.38l-43.84,16.86a7.28,7.28,0,0,0-4.21,4.21L101.69,166.6A14.67,14.67,0,0,1,88,176Z" fill="currentColor"/>
+          <path d="M400,256a16,16,0,0,1-14.93-10.26l-22.84-59.37a8,8,0,0,0-4.6-4.6l-59.37-22.84a16,16,0,0,1,0-29.86l59.37-22.84a8,8,0,0,0,4.6-4.6L384.9,42.68a16.45,16.45,0,0,1,13.17-10.57,16,16,0,0,1,16.86,10.15l22.84,59.37a8,8,0,0,0,4.6,4.6l59.37,22.84a16,16,0,0,1,0,29.86l-59.37,22.84a8,8,0,0,0-4.6,4.6l-22.84,59.37A16,16,0,0,1,400,256Z" fill="currentColor"/>
+        </svg>
+        Auto
+      `;
+    }
+  }
+}
+
+async function updateSummarySelectorLabel() {
+  const label = document.getElementById('summarySelectorLabel');
+  if (!label) return;
+
+  if (window.selectedSummaryTypeId) {
+    const type = window.summaryTypes.find(t => t.id === window.selectedSummaryTypeId);
+    label.textContent = type ? type.name : 'Default';
+  } else {
+    label.textContent = 'Default';
+  }
+}
+
+// ============= Toast Helper =============
+
+function showToast(message, type = 'success') {
+  const toast = document.createElement('div');
+  toast.className = `toast ${type === 'error' ? 'toast-error' : ''}`;
+  toast.textContent = message;
+  document.body.appendChild(toast);
+
+  // Remove toast after 3 seconds
+  setTimeout(() => {
+    toast.style.opacity = '0';
+    setTimeout(() => {
+      if (toast.parentNode) {
+        document.body.removeChild(toast);
+      }
+    }, 300);
+  }, 3000);
+}
