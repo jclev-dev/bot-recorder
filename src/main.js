@@ -596,10 +596,22 @@ function initSDK() {
     }
 
     let noteId = null;
+    let recallRecordingId = null;
     if (global.activeMeetingIds && global.activeMeetingIds[evt.window.id]) {
       noteId = global.activeMeetingIds[evt.window.id].noteId;
+      recallRecordingId = global.activeMeetingIds[evt.window.id].recallRecordingId || null;
     }
     activeRecordings.removeRecording(evt.window.id);
+    delete speakerAttribution[evt.window.id];
+
+    // Replace the real-time transcript with Recall's authoritative,
+    // fully speaker-attributed version once it finishes processing.
+    if (noteId && recallRecordingId) {
+      fetchAndApplyServerTranscript(noteId, recallRecordingId)
+        .catch(err => console.warn('[server-transcript] fetch failed:', err.message));
+    } else {
+      console.warn('[server-transcript] no recall recording id captured; keeping live transcript for note', noteId);
+    }
 
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('recording-state-change', {
@@ -654,15 +666,20 @@ function initSDK() {
       });
     }
 
+    // Capture the Recall server-side recording id (present on every realtime
+    // event). We use it after the meeting to fetch the authoritative,
+    // fully speaker-attributed transcript.
+    captureRecallRecordingId(evt.window?.id, evt.data?.recording?.id);
+
     // Handle different event types
     if (evt.event === 'transcript.data' && evt.data && evt.data.data) {
       await processTranscriptData(evt);
     }
-    else if (evt.event === 'transcript.provider_data' && evt.data && evt.data.data) {
-      await processTranscriptProviderData(evt);
-    }
     else if (evt.event === 'participant_events.join' && evt.data && evt.data.data) {
       await processParticipantJoin(evt);
+    }
+    else if ((evt.event === 'participant_events.speech_on' || evt.event === 'participant_events.speech_off') && evt.data && evt.data.data) {
+      processSpeechEvent(evt);
     }
     else if (evt.event === 'video_separate_png.data' && evt.data && evt.data.data) {
       await processVideoFrame(evt);
@@ -1420,6 +1437,10 @@ async function processParticipantJoin(evt) {
 
     console.log(`Participant joined: ${participantName} (ID: ${participantId}, Host: ${isHost})`);
 
+    // Seed the speaker-attribution cache so transcript utterances with a null
+    // name can be recovered by participant id.
+    rememberSpeakerName(windowId, participantId, participantData.name);
+
     // Skip "Host" and "Guest" generic names
     if (participantName === "Host" || participantName === "Guest" || participantName.includes("others") || (participantName.split(" ").length > 3)) {
       console.log(`Skipping generic participant name: ${participantName}`);
@@ -1483,17 +1504,136 @@ async function processParticipantJoin(evt) {
   }
 }
 
-let currentUnknownSpeaker = -1;
+// Live speaker-attribution state, keyed by SDK window id.
+// Recall populates participant.name on transcript.data only when an utterance
+// overlaps an active-speaker event; many short utterances arrive with name=null.
+// We recover those by (a) caching every id->name we see and (b) tracking the
+// most recent active speaker from participant_events.speech_on/off.
+const speakerAttribution = {}; // windowId -> { byId: {}, lastActiveSpeaker: {id, name} | null }
 
-async function processTranscriptProviderData(evt) {
-  // let speakerId = evt.data.data.payload.
-  try {
-    if (evt.data.data.data.payload.channel.alternatives[0].words[0].speaker !== undefined) {
-      currentUnknownSpeaker = evt.data.data.data.payload.channel.alternatives[0].words[0].speaker;
-    }
-  } catch (error) {
-    // console.error("Error processing provider data:", error);
+function getSpeakerState(windowId) {
+  if (!speakerAttribution[windowId]) {
+    speakerAttribution[windowId] = { byId: {}, lastActiveSpeaker: null };
   }
+  return speakerAttribution[windowId];
+}
+
+function rememberSpeakerName(windowId, id, name) {
+  if (id === undefined || id === null) return;
+  if (!name || name === "Host" || name === "Guest") return;
+  getSpeakerState(windowId).byId[id] = name;
+}
+
+// Track the active speaker timeline so null-name transcript utterances can be
+// attributed to whoever was most recently speaking.
+function processSpeechEvent(evt) {
+  try {
+    const windowId = evt.window?.id;
+    if (!windowId) return;
+
+    const participant = evt.data?.data?.participant;
+    if (!participant) return;
+
+    const id = participant.id;
+    const name = participant.name;
+    rememberSpeakerName(windowId, id, name);
+
+    if (evt.event === 'participant_events.speech_on') {
+      const resolvedName = name || (id != null ? getSpeakerState(windowId).byId[id] : null);
+      if (resolvedName) {
+        getSpeakerState(windowId).lastActiveSpeaker = { id, name: resolvedName };
+      }
+    }
+    // On speech_off we intentionally keep lastActiveSpeaker so that trailing
+    // utterances finalized just after someone stops talking still attribute to them.
+  } catch (error) {
+    console.error('Error processing speech event:', error);
+  }
+}
+
+// Remember the Recall server-side recording id for an active meeting, and
+// persist it to the note the first time we see it so the authoritative
+// transcript can be fetched even after a restart.
+function captureRecallRecordingId(windowId, recallRecordingId) {
+  if (!windowId || !recallRecordingId) return;
+  if (!global.activeMeetingIds || !global.activeMeetingIds[windowId]) return;
+  if (global.activeMeetingIds[windowId].recallRecordingId === recallRecordingId) return;
+
+  global.activeMeetingIds[windowId].recallRecordingId = recallRecordingId;
+  const noteId = global.activeMeetingIds[windowId].noteId;
+  if (!noteId) return;
+
+  // Persist once (best-effort) so a later session can still backfill.
+  fileOperationManager.scheduleOperation(async (meetingsData) => {
+    const idx = meetingsData.pastMeetings.findIndex(m => m.id === noteId);
+    if (idx === -1) return null;
+    if (meetingsData.pastMeetings[idx].recallRecordingId === recallRecordingId) return null;
+    meetingsData.pastMeetings[idx].recallRecordingId = recallRecordingId;
+    return meetingsData;
+  }).catch(err => console.warn('[server-transcript] failed to persist recording id:', err.message));
+}
+
+// Convert Recall's server-side diarized transcript into our local entry shape.
+function convertServerTranscript(serverData) {
+  const arr = Array.isArray(serverData) ? serverData : [];
+  return arr.map(u => ({
+    text: (u.words || []).map(w => w.text).join(" ").trim(),
+    speaker: u.participant?.name || "Unknown Speaker",
+    timestamp: u.words?.[0]?.start_timestamp?.absolute
+      || (typeof u.words?.[0]?.start_timestamp === 'string' ? u.words[0].start_timestamp : null)
+      || new Date().toISOString()
+  })).filter(e => e.text.length > 0);
+}
+
+// After a recording ends, Recall produces a clean, fully speaker-attributed
+// transcript (usually within ~30s). Poll for it and replace the real-time
+// (heuristically attributed) transcript once it's ready.
+async function fetchAndApplyServerTranscript(noteId, recordingId, { attempts = 20, intervalMs = 15000 } = {}) {
+  const base = process.env.RECALLAI_API_URL;
+  const key = process.env.RECALLAI_API_KEY;
+  if (!base || !key) { console.warn('[server-transcript] missing Recall API config; skipping'); return; }
+  if (!noteId || !recordingId) { console.warn('[server-transcript] missing noteId/recordingId; skipping'); return; }
+
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const r = await axios.get(`${base}/api/v1/recording/${recordingId}/`, {
+        headers: { Authorization: `Token ${key}` }, timeout: 20000
+      });
+      const t = r.data?.media_shortcuts?.transcript;
+      const code = t?.status?.code;
+
+      if (code === 'done' && t?.data?.download_url) {
+        const dl = await axios.get(t.data.download_url, { timeout: 30000 });
+        const entries = convertServerTranscript(dl.data);
+        if (entries.length === 0) {
+          console.warn('[server-transcript] downloaded transcript was empty; keeping live version');
+          return;
+        }
+        await fileOperationManager.scheduleOperation(async (meetingsData) => {
+          const idx = meetingsData.pastMeetings.findIndex(m => m.id === noteId);
+          if (idx === -1) return null;
+          meetingsData.pastMeetings[idx].transcript = entries;
+          meetingsData.pastMeetings[idx].transcriptSource = 'recall-server';
+          return meetingsData;
+        });
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('transcript-updated', noteId);
+        }
+        console.log(`[server-transcript] applied ${entries.length} attributed entries to note ${noteId}`);
+        return;
+      }
+
+      if (code === 'failed' || code === 'deleted') {
+        console.warn(`[server-transcript] transcript status=${code}; keeping live version`);
+        return;
+      }
+      console.log(`[server-transcript] not ready (status=${code || 'unknown'}), attempt ${i + 1}/${attempts}`);
+    } catch (e) {
+      console.warn(`[server-transcript] poll error attempt ${i + 1}: ${e.response?.status || e.message}`);
+    }
+    await new Promise(res => setTimeout(res, intervalMs));
+  }
+  console.warn(`[server-transcript] timed out waiting for transcript of note ${noteId}; keeping live version`);
 }
 
 // Function to process transcript data and store it with the meeting note
@@ -1523,15 +1663,34 @@ async function processTranscriptData(evt) {
       return; // No words to process
     }
 
-    // Get speaker information
+    // Resolve the speaker. Recall sets participant.name only when this utterance
+    // overlapped an active-speaker event; otherwise name is null. Recover the
+    // name via the id->name cache, then the active-speaker timeline.
+    const participant = evt.data.data.participant;
+    const rawName = participant?.name;
+    const participantId = participant?.id;
+    const isRealName = rawName && rawName !== "Host" && rawName !== "Guest";
+
+    const state = getSpeakerState(windowId);
     let speaker;
-    if (evt.data.data.participant?.name && evt.data.data.participant?.name !== "Host" && evt.data.data.participant?.name !== "Guest") {
-      speaker = evt.data.data.participant?.name;
-    } else if (currentUnknownSpeaker !== -1) {
-      speaker = `Speaker ${currentUnknownSpeaker}`;
+    let via;
+    if (isRealName) {
+      speaker = rawName;
+      via = "name";
+      rememberSpeakerName(windowId, participantId, rawName);
+    } else if (participantId !== undefined && participantId !== null && state.byId[participantId]) {
+      speaker = state.byId[participantId];
+      via = "id-cache";
+    } else if (state.lastActiveSpeaker?.name) {
+      speaker = state.lastActiveSpeaker.name;
+      via = "active-speaker";
     } else {
       speaker = "Unknown Speaker";
+      via = "fallback";
     }
+
+    // Diagnostic breadcrumb to confirm attribution rates on the next real call.
+    console.log(`[speaker-attr] rawName=${JSON.stringify(rawName ?? null)} id=${participantId ?? null} -> ${JSON.stringify(speaker)} (via ${via})`);
 
     // Combine all words into a single text
     const text = words.map(word => word.text).join(" ");
