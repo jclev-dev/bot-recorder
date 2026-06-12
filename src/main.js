@@ -223,6 +223,35 @@ const meetingsFilePath = path.join(app.getPath('userData'), 'meetings.json');
 // Path for RecallAI SDK recordings
 const RECORDING_PATH = path.join(app.getPath("userData"), 'recordings');
 
+// Persistent diagnostics log for the Recall.ai SDK. Detection happens inside
+// the SDK's native layer and is otherwise invisible to us: when a meeting is
+// NOT detected there is no JS event to observe. This file captures the SDK's
+// own `log` and `permission-status` events so a silent detection failure
+// (e.g. a Google Meet opened under a different account / Chrome profile that
+// the detector never matched) leaves recorded evidence to inspect afterward.
+const SDK_LOG_PATH = path.join(app.getPath('userData'), 'sdk-diagnostics.log');
+const SDK_LOG_MAX_BYTES = 5 * 1024 * 1024; // rotate at ~5MB so it can't grow unbounded
+
+// Append one structured entry to the SDK diagnostics log. Fire-and-forget and
+// fully guarded — diagnostics must never break the app if disk writes fail.
+function appendSdkDiagnostic(entry) {
+  try {
+    const line = JSON.stringify({ ts: new Date().toISOString(), ...entry }) + '\n';
+    // Cheap rotation: when the file gets large, move it aside once.
+    try {
+      const stat = fs.statSync(SDK_LOG_PATH);
+      if (stat.size > SDK_LOG_MAX_BYTES) {
+        fs.renameSync(SDK_LOG_PATH, `${SDK_LOG_PATH}.1`);
+      }
+    } catch (_) { /* file may not exist yet */ }
+    fs.appendFile(SDK_LOG_PATH, line, (err) => {
+      if (err) console.error('Failed to write SDK diagnostic:', err.message);
+    });
+  } catch (e) {
+    console.error('appendSdkDiagnostic error:', e.message);
+  }
+}
+
 // Global state to track active recordings
 const activeRecordings = {
   // Map of recordingId -> {noteId, platform, state}
@@ -421,6 +450,12 @@ function initSDK() {
   RecallAiSdk.init({
     // dev: true,
     api_url: process.env.RECALLAI_API_URL,
+    // Re-acquire macOS permissions on every launch. These grants are required
+    // for meeting detection (accessibility) and capture (screen-capture), and
+    // macOS can silently invalidate them when the app binary changes — e.g.
+    // after an SDK upgrade. If already granted this is a no-op (no prompt);
+    // if not, the user is prompted and we get a `permission-status` event.
+    acquirePermissionsOnStartup: ['accessibility', 'screen-capture', 'microphone'],
     config: {
       recording_path: RECORDING_PATH
     }
@@ -434,6 +469,13 @@ function initSDK() {
     sdkLogger.logEvent('meeting-detected', {
       platform: evt.window.platform,
       windowId: evt.window.id
+    });
+    appendSdkDiagnostic({
+      kind: 'meeting-detected',
+      windowId: evt.window.id,
+      platform: evt.window.platform,
+      title: evt.window.title,
+      url: evt.window.url
     });
 
     detectedMeeting = evt;
@@ -549,6 +591,7 @@ function initSDK() {
     sdkLogger.logEvent('meeting-closed', {
       windowId: evt.window.id
     });
+    appendSdkDiagnostic({ kind: 'meeting-closed', windowId: evt.window && evt.window.id });
 
     // Clean up the global tracking when a meeting ends
     if (evt.window && evt.window.id && global.activeMeetingIds && global.activeMeetingIds[evt.window.id]) {
@@ -624,6 +667,41 @@ function initSDK() {
 
   RecallAiSdk.addEventListener('permissions-granted', async (evt) => {
     console.log("PERMISSIONS GRANTED");
+    appendSdkDiagnostic({ kind: 'permissions-granted' });
+  });
+
+  // The SDK reports the status of each macOS permission individually. A
+  // non-granted accessibility/screen-capture permission is the most common
+  // cause of detection silently failing, so surface it loudly.
+  RecallAiSdk.addEventListener('permission-status', async (evt) => {
+    const { permission, status } = evt;
+    console.log(`Permission status: ${permission} = ${status}`);
+
+    sdkLogger.logEvent('permission-status', { permission, status });
+    appendSdkDiagnostic({ kind: 'permission-status', permission, status });
+
+    // Anything other than a granted/authorized status means detection or
+    // capture may not work. Alert the user instead of failing silently.
+    const ok = /grant|authorized/i.test(String(status));
+    if (!ok) {
+      new Notification({
+        title: 'Meeting Bot permission needed',
+        body: `${permission} is "${status}". Detection may not work until it's granted in System Settings.`
+      }).show();
+    }
+  });
+
+  // The SDK emits structured internal logs (subsystem/category/level) that
+  // describe what its detection layer is doing. We previously discarded these
+  // entirely; capture the meaningful ones to the debug panel and to disk so a
+  // missed meeting can be diagnosed after the fact. `debug` level is dropped
+  // to avoid per-frame flooding.
+  RecallAiSdk.addEventListener('log', (evt) => {
+    const { level, message, subsystem, category, window_id } = evt;
+    if (level === 'debug') return;
+
+    sdkLogger.logEvent('sdk-log', { level, subsystem, category, message, windowId: window_id });
+    appendSdkDiagnostic({ kind: 'sdk-log', level, subsystem, category, message, window_id });
   });
 
   RecallAiSdk.addEventListener('recording-started', async (evt) => {
@@ -696,6 +774,7 @@ function initSDK() {
       errorType: type,
       errorMessage: message
     });
+    appendSdkDiagnostic({ kind: 'error', errorType: type, message, windowId: evt.window && evt.window.id });
 
     // Show notification for errors
     let notification = new Notification({
@@ -747,6 +826,34 @@ ipcMain.handle('debugGetHandlers', async () => {
   const handlers = Object.keys(ipcMain._invokeHandlers);
   console.log("Registered handlers:", handlers);
   return handlers;
+});
+
+// Capture a snapshot of every application/window the SDK can currently see via
+// the macOS accessibility tree, plus the recent diagnostics log. Run this while
+// an undetected meeting is on screen to confirm whether the SDK sees the
+// browser window at all and what URL/title it reads (e.g. a `?authuser=N`
+// Google Meet in a second Chrome profile). Writes a timestamped JSON file and
+// returns its path. Trigger from the renderer/DevTools: electronAPI.dumpSdkState()
+ipcMain.handle('dump-sdk-state', async () => {
+  try {
+    const applications = await RecallAiSdk.dumpAllApplications();
+    const snapshot = {
+      capturedAt: new Date().toISOString(),
+      detectedMeeting: detectedMeeting ? detectedMeeting.window : null,
+      applications
+    };
+    const outPath = path.join(
+      app.getPath('userData'),
+      `sdk-state-${Date.now()}.json`
+    );
+    await fs.promises.writeFile(outPath, JSON.stringify(snapshot, null, 2));
+    console.log('Wrote SDK state snapshot to', outPath);
+    appendSdkDiagnostic({ kind: 'dump-sdk-state', outPath });
+    return { success: true, path: outPath, diagnosticsLog: SDK_LOG_PATH };
+  } catch (e) {
+    console.error('dump-sdk-state failed:', e.message);
+    return { success: false, error: e.message };
+  }
 });
 
 // Handler to get active recording ID for a note
